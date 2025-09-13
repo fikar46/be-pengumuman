@@ -91,27 +91,8 @@ app.post("/process-tryout/:idTryout", async (req, res) => {
     );
 
     // 2. Hitung nilai + ranking (pakai CTE + ROW_NUMBER)
-   await conn.query(
+ await conn.query(
   `
-  WITH nilai_user AS (
-    SELECT 
-      jut.id_user,
-      u.username,
-      jut.peminatan,
-      SUM(CASE WHEN jut.status = 'benar' THEN st.point*100 ELSE 0 END) / 7 AS total
-    FROM jawaban_user_tryout jut
-    JOIN soal_tryout st 
-      ON st.no_soal = jut.no_soal 
-     AND st.id_mapel = jut.id_mapel 
-     AND st.id_tryout = jut.id_tryout
-    JOIN users u ON u.id = jut.id_user
-    WHERE jut.id_tryout = ?
-    GROUP BY jut.id_user, u.username, jut.peminatan
-  ),
-  ranking AS (
-    SELECT n.*, ROW_NUMBER() OVER (ORDER BY total DESC) AS \`rank\`
-    FROM nilai_user n
-  )
   INSERT INTO rank_tryout_2025
     (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year)
   SELECT
@@ -121,14 +102,37 @@ app.post("/process-tryout/:idTryout", async (req, res) => {
     r.total,
     u.instansi,
     u.provinsi,
-    r.\`rank\`,
+    r.rnk,
     ?,
     2026
-  FROM ranking r
+  FROM (
+    SELECT 
+      n.id_user,
+      n.username,
+      n.peminatan,
+      n.total,
+      ROW_NUMBER() OVER (ORDER BY n.total DESC) AS rnk
+    FROM (
+      SELECT 
+        jut.id_user,
+        u.username,
+        jut.peminatan,
+        SUM(CASE WHEN jut.status = 'benar' THEN st.point*100 ELSE 0 END) / 7 AS total
+      FROM jawaban_user_tryout jut
+      JOIN soal_tryout st 
+        ON st.no_soal = jut.no_soal 
+       AND st.id_mapel = jut.id_mapel 
+       AND st.id_tryout = jut.id_tryout
+      JOIN users u ON u.id = jut.id_user
+      WHERE jut.id_tryout = ?
+      GROUP BY jut.id_user, u.username, jut.peminatan
+    ) n
+  ) r
   LEFT JOIN userdata u ON u.id_user = r.id_user;
   `,
   [idTryout, idTryout]
 );
+
 
 
     // 3. Copy jawaban user ke tabel pembahasan
