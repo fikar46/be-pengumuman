@@ -203,6 +203,9 @@ app.get("/ranking/:idTryout", async (req, res) => {
 });
 
 // jalankan server
-app.listen(2234, () => {
+const server = app.listen(2234, () => {
   console.log("Server pengumuman running on http://localhost:2234");
 });
+
+server.timeout = 600000; // untuk request
+server.keepAliveTimeout = 620000; // jaga supaya koneksi gak putus duluan
