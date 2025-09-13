@@ -48,7 +48,7 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
 
     await pool.query(
       `DELETE FROM jawaban_user_tryout WHERE id_tryout = ?`,
-      [idTryout]
+      [id_tryout]
     );
     // 3. mapping untuk bulk insert
     const values = allJawaban.map(j => [
