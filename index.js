@@ -15,6 +15,67 @@ const pool = mysql.createPool({
   queueLimit: 0,
 });
 
+app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
+  try {
+    const { id_tryout } = req.params;
+
+    // 1. ambil jawaban_user_permapel
+    const [rows] = await db.query(
+      "SELECT jawaban_user_permapel FROM jawaban_user_tryout_v2 WHERE id_tryout = ?",
+      [id_tryout]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Data tidak ditemukan" });
+    }
+
+    // 2. Parse semua JSON jadi array jawaban
+    let allJawaban = [];
+    rows.forEach(r => {
+      try {
+        const parsed = JSON.parse(r.jawaban_user_permapel);
+        if (Array.isArray(parsed)) {
+          allJawaban.push(...parsed);
+        }
+      } catch (e) {
+        console.error("JSON parse error:", e);
+      }
+    });
+
+    if (allJawaban.length === 0) {
+      return res.status(400).json({ success: false, message: "Tidak ada jawaban valid" });
+    }
+
+    // 3. mapping untuk bulk insert
+    const values = allJawaban.map(j => [
+      j.id_user,
+      j.id_tryout,
+      j.id_mapel,
+      j.no_soal,
+      j.status?.replace(/"/g, ""),
+      j.jawaban?.replace(/"/g, ""),
+      j.peminatan?.replace(/"/g, "")
+    ]);
+
+    const sql = `
+      INSERT INTO jawaban_user_tryout 
+      (id_user, id_tryout, id_mapel, no_soal, status, jawaban, peminatan)
+      VALUES ?
+    `;
+
+    // 4. bulk insert
+    const [result] = await db.query(sql, [values]);
+
+    res.json({
+      success: true,
+      inserted: result.affectedRows
+    });
+  } catch (err) {
+    console.error("Bulk insert error:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // 🚀 API untuk generate ranking & simpan ke rank_tryout_2025
 app.post("/process-tryout/:idTryout", async (req, res) => {
   const { idTryout } = req.params;
@@ -22,8 +83,6 @@ app.post("/process-tryout/:idTryout", async (req, res) => {
 
   try {
     await conn.beginTransaction();
-
-    await conn.query(`CALL saveJawabanUserTryout(?)`, [idTryout]);
 
     // 1. Hapus ranking lama biar tidak dobel
     await conn.query(
