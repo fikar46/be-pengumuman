@@ -138,6 +138,6 @@ app.get("/ranking/:idTryout", async (req, res) => {
 });
 
 // jalankan server
-app.listen(3000, () => {
-  console.log("Server running on http://localhost:3000");
+app.listen(2234, () => {
+  console.log("Server pengumuman running on http://localhost:2234");
 });
