@@ -46,7 +46,7 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
       return res.status(400).json({ success: false, message: "Tidak ada jawaban valid" });
     }
 
-    await conn.query(
+    await pool.query(
       `DELETE FROM jawaban_user_tryout WHERE id_tryout = ?`,
       [idTryout]
     );
