@@ -20,7 +20,7 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
     const { id_tryout } = req.params;
 
     // 1. ambil jawaban_user_permapel
-    const [rows] = await db.query(
+    const [rows] = await pool.query(
       "SELECT jawaban_user_permapel FROM jawaban_user_tryout_v2 WHERE id_tryout = ?",
       [id_tryout]
     );
@@ -64,7 +64,7 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
     `;
 
     // 4. bulk insert
-    const [result] = await db.query(sql, [values]);
+    const [result] = await pool.query(sql, [values]);
 
     res.json({
       success: true,
