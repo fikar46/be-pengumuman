@@ -81,8 +81,8 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
 });
 
 // 🚀 API untuk generate ranking & simpan ke rank_tryout_2025
-app.post("/process-tryout/:idTryout", async (req, res) => {
-  const { idTryout } = req.params;
+app.post("/process-tryout", async (req, res) => {
+  const { idTryout,jenis } = req.body;
   const conn = await pool.getConnection();
 
   try {
@@ -95,7 +95,7 @@ app.post("/process-tryout/:idTryout", async (req, res) => {
     );
 
     // 2. Hitung nilai + ranking (pakai CTE + ROW_NUMBER)
- await conn.query(
+await conn.query(
   `
   INSERT INTO rank_tryout_2025
     (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year)
@@ -121,7 +121,14 @@ app.post("/process-tryout/:idTryout", async (req, res) => {
         jut.id_user,
         u.username,
         jut.peminatan,
-        SUM(CASE WHEN jut.status = 'benar' THEN st.point*100 ELSE 0 END) / 7 AS total
+        SUM(CASE 
+              WHEN jut.status = 'benar' THEN 
+                CASE 
+                  WHEN ? = 'tka' THEN 5 
+                  ELSE st.point * 100 
+                END 
+              ELSE 0 
+            END) ${jenis === 'tka' ? '' : '/ 7'} AS total
       FROM jawaban_user_tryout jut
       JOIN soal_tryout st 
         ON st.no_soal = jut.no_soal 
@@ -134,7 +141,7 @@ app.post("/process-tryout/:idTryout", async (req, res) => {
   ) r
   LEFT JOIN userdata u ON u.id_user = r.id_user;
   `,
-  [idTryout, idTryout]
+  [idTryout, jenis, idTryout]
 );
 
 
