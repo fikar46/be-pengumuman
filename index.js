@@ -141,7 +141,7 @@ await conn.query(
        AND st.id_tryout = jut.id_tryout
       JOIN users u ON u.id = jut.id_user
       WHERE jut.id_tryout = ?
-      GROUP BY jut.id_user, u.username, jut.peminatan
+      GROUP BY jut.id_user, u.username
     ) n
   ) r
   LEFT JOIN userdata u ON u.id_user = r.id_user;
