@@ -150,7 +150,13 @@ await conn.query(
 );
 
 
-
+    await conn.query(
+      `delete
+      FROM jawaban_user_tryout_pembahasan 
+      WHERE id_tryout = ?
+    `,
+      [idTryout]
+    );
     // 3. Copy jawaban user ke tabel pembahasan
     await conn.query(
       `
@@ -162,7 +168,13 @@ await conn.query(
     `,
       [idTryout]
     );
-
+     await conn.query(
+      `delete
+      FROM jawaban_user_tryout_pembahasan_v2 
+      WHERE id_tryout = ?
+    `,
+      [idTryout]
+    );
     await conn.query(
       `
       INSERT INTO jawaban_user_tryout_pembahasan_v2 
