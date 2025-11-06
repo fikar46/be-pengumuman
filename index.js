@@ -21,7 +21,7 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
 
     // 1. ambil jawaban_user_permapel
     const [rows] = await pool.query(
-      "SELECT jawaban_user_permapel FROM jawaban_user_tryout_v2 WHERE id_tryout = ?",
+      "SELECT id_user, jawaban_user_permapel FROM jawaban_user_tryout_v2 WHERE id_tryout = ?",
       [id_tryout]
     );
 
@@ -30,11 +30,16 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
     }
 
     // 2. Parse semua JSON jadi array jawaban
+    
     let allJawaban = [];
     rows.forEach(r => {
       try {
         const parsed = JSON.parse(r.jawaban_user_permapel);
         if (Array.isArray(parsed)) {
+          // tambahkan id_user dari tabel luar ke setiap jawaban
+          parsed.forEach(p => {
+            p.id_user = r.id_user;
+          });
           allJawaban.push(...parsed);
         }
       } catch (e) {
