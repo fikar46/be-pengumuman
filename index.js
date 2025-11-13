@@ -1,8 +1,10 @@
 import express from "express";
 import mysql from "mysql2/promise";
+import Redis from "ioredis";
 
 const app = express();
 app.use(express.json());
+const redis = new Redis();
 
 // koneksi pool database
 const pool = mysql.createPool({
@@ -158,6 +160,7 @@ await conn.query(
     `,
       [idTryout]
     );
+    
     // 3. Copy jawaban user ke tabel pembahasan
     await conn.query(
       `
@@ -188,6 +191,7 @@ await conn.query(
     );
 
     await conn.commit();
+    await redis.flushall();
     res.json({ success: true, message: `Ranking & pembahasan berhasil diproses untuk tryout ${idTryout}` });
   } catch (err) {
     await conn.rollback();
@@ -197,6 +201,61 @@ await conn.query(
     conn.release();
   }
 });
+
+
+app.post("/delete-jawaban-pembahasan", async (req, res) => {
+  const { idTryout } = req.body;
+  const conn = await pool.getConnection();
+
+  try {
+    await conn.beginTransaction();
+
+    await conn.query(
+      `DELETE FROM jawaban_user_tryout_pembahasan WHERE id_tryout = ?`,
+      [idTryout]
+    );
+
+    await conn.commit();
+    res.json({ success: true, message: `Data pembahasan untuk tryout ${idTryout} berhasil dihapus` });
+  } catch (err) {
+    await conn.rollback();
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+
+app.post("/copy-jawaban-pembahasan", async (req, res) => {
+  const { idTryout } = req.body;
+  const conn = await pool.getConnection();
+
+  try {
+    await conn.beginTransaction();
+
+    await conn.query(
+      `
+      INSERT INTO jawaban_user_tryout_pembahasan 
+          (id_user,id_tryout,id_mapel,no_soal, status, jawaban,peminatan)
+      SELECT id_user,id_tryout,id_mapel,no_soal, status,jawaban,peminatan
+      FROM jawaban_user_tryout 
+      WHERE id_tryout = ?
+      `,
+      [idTryout]
+    );
+
+    await conn.commit();
+    res.json({ success: true, message: `Data pembahasan untuk tryout ${idTryout} berhasil dicopy` });
+  } catch (err) {
+    await conn.rollback();
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
 
 // 🚀 API untuk ambil ranking hasil
 app.get("/ranking/:idTryout", async (req, res) => {
