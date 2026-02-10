@@ -106,48 +106,60 @@ app.post("/process-tryout", async (req, res) => {
 await conn.query(
   `
   INSERT INTO rank_tryout_2025
-    (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year)
-  SELECT
-    r.id_user,
-    r.username,
-    r.peminatan,
-    r.total,
-    u.instansi,
-    u.provinsi,
-    r.rnk,
-    ?,
-    2026
+(id_user, username, peminatan, total, instansi, provinsi, `rank`, id_tryout, year)
+SELECT
+  r.id_user,
+  r.username,
+  r.peminatan,
+  r.total,
+  u.instansi,
+  u.provinsi,
+  r.rnk,
+  ?,
+  2026
+FROM (
+  SELECT 
+    n.id_user,
+    n.username,
+    n.peminatan,
+    n.total,
+    ROW_NUMBER() OVER (ORDER BY n.total DESC) AS rnk
   FROM (
     SELECT 
-      n.id_user,
-      n.username,
-      n.peminatan,
-      n.total,
-      ROW_NUMBER() OVER (ORDER BY n.total DESC) AS rnk
+      jut.id_user,
+      u.username,
+      jut.peminatan,
+      SUM(
+        CASE 
+          WHEN jut.status = 'benar' THEN 
+            CASE 
+              WHEN ? = 'tka' THEN 5 
+              ELSE st.point * 100 
+            END
+          ELSE 0
+        END
+      ) ${jenis === 'tka' ? '' : '/ 7'} AS total
     FROM (
-      SELECT 
-        jut.id_user,
-        u.username,
-        jut.peminatan,
-        SUM(CASE 
-              WHEN jut.status = 'benar' THEN 
-                CASE 
-                  WHEN ? = 'tka' THEN 5 
-                  ELSE st.point * 100 
-                END 
-              ELSE 0 
-            END) ${jenis === 'tka' ? '' : '/ 7'} AS total
+      SELECT jut.*
       FROM jawaban_user_tryout jut
-      JOIN soal_tryout st 
-        ON st.no_soal = jut.no_soal 
-       AND st.id_mapel = jut.id_mapel 
-       AND st.id_tryout = jut.id_tryout
-      JOIN users u ON u.id = jut.id_user
-      WHERE jut.id_tryout = ?
-      GROUP BY jut.id_user, u.username
-    ) n
-  ) r
-  LEFT JOIN userdata u ON u.id_user = r.id_user;
+      JOIN (
+        SELECT 
+          MAX(id) AS max_id
+        FROM jawaban_user_tryout
+        WHERE id_tryout = ?
+        GROUP BY id_user, id_tryout, id_mapel, no_soal
+      ) x ON x.max_id = jut.id
+    ) jut
+    JOIN soal_tryout st 
+      ON st.no_soal = jut.no_soal
+     AND st.id_mapel = jut.id_mapel
+     AND st.id_tryout = jut.id_tryout
+    JOIN users u ON u.id = jut.id_user
+    GROUP BY jut.id_user, u.username
+  ) n
+) r
+LEFT JOIN userdata u ON u.id_user = r.id_user;
+
   `,
   [idTryout, jenis, idTryout]
 );
