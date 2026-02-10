@@ -106,7 +106,7 @@ app.post("/process-tryout", async (req, res) => {
 await conn.query(
   `
   INSERT INTO rank_tryout_2025
-(id_user, username, peminatan, total, instansi, provinsi, `rank`, id_tryout, year)
+(id_user, username, peminatan, total, instansi, provinsi,  \`rank\`, id_tryout, year)
 SELECT
   r.id_user,
   r.username,
