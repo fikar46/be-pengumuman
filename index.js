@@ -17,6 +17,133 @@ const pool = mysql.createPool({
   queueLimit: 0,
 });
 
+const AUTO_WEIGHT_MIN_TOTAL = 9;
+const AUTO_WEIGHT_MAX_TOTAL = 10;
+const AUTO_WEIGHT_TARGET_TOTAL = 9.5;
+
+async function buildLatestJawabanTempTable(conn, idTryout) {
+  await conn.query(`DROP TEMPORARY TABLE IF EXISTS tmp_latest_jawaban`);
+  await conn.query(
+    `
+    CREATE TEMPORARY TABLE tmp_latest_jawaban AS
+    SELECT j.*
+    FROM jawaban_user_tryout j
+    JOIN (
+      SELECT MAX(id) AS max_id
+      FROM jawaban_user_tryout
+      WHERE id_tryout = ?
+      GROUP BY id_user, id_tryout, id_mapel, no_soal
+    ) x ON x.max_id = j.id
+  `,
+    [idTryout]
+  );
+
+  await conn.query(
+    `
+    ALTER TABLE tmp_latest_jawaban
+    ADD INDEX idx_lj_mapel_soal (id_mapel, no_soal),
+    ADD INDEX idx_lj_user (id_user),
+    ADD INDEX idx_lj_status (status)
+  `
+  );
+}
+
+async function autoSetBobotSoalByTryout(conn, idTryout) {
+  const [mapels] = await conn.query(
+    `
+    SELECT id_mapel, COUNT(*) AS total_soal
+    FROM soal_tryout
+    WHERE id_tryout = ?
+    GROUP BY id_mapel
+  `,
+    [idTryout]
+  );
+
+  if (!mapels.length) {
+    return { updatedRows: 0, mapelCount: 0 };
+  }
+  const targetTotal = Math.min(
+    AUTO_WEIGHT_MAX_TOTAL,
+    Math.max(AUTO_WEIGHT_MIN_TOTAL, AUTO_WEIGHT_TARGET_TOTAL)
+  );
+
+  await conn.query(`DROP TEMPORARY TABLE IF EXISTS tmp_soal_stats`);
+  await conn.query(
+    `
+    CREATE TEMPORARY TABLE tmp_soal_stats AS
+    SELECT
+      st.id_tryout,
+      st.id_mapel,
+      st.no_soal,
+      COALESCE(SUM(CASE WHEN lj.status = 'benar' THEN 1 ELSE 0 END), 0) AS benar,
+      COALESCE(SUM(CASE WHEN lj.status IN ('benar', 'salah') THEN 1 ELSE 0 END), 0) AS attempts
+    FROM soal_tryout st
+    LEFT JOIN tmp_latest_jawaban lj
+      ON lj.id_tryout = st.id_tryout
+     AND lj.id_mapel = st.id_mapel
+     AND lj.no_soal = st.no_soal
+    WHERE st.id_tryout = ?
+    GROUP BY st.id_tryout, st.id_mapel, st.no_soal
+  `,
+    [idTryout]
+  );
+  await conn.query(
+    `
+    ALTER TABLE tmp_soal_stats
+    ADD INDEX idx_tss_mapel_soal (id_mapel, no_soal)
+  `
+  );
+
+  await conn.query(`DROP TEMPORARY TABLE IF EXISTS tmp_mapel_totals`);
+  await conn.query(
+    `
+    CREATE TEMPORARY TABLE tmp_mapel_totals AS
+    SELECT
+      id_mapel,
+      COUNT(*) AS soal_count,
+      SUM(
+        CASE
+          WHEN attempts <= 0 THEN 0.5
+          ELSE 1 - (benar / attempts)
+        END
+      ) AS raw_total
+    FROM tmp_soal_stats
+    GROUP BY id_mapel
+  `
+  );
+  await conn.query(
+    `
+    ALTER TABLE tmp_mapel_totals
+    ADD PRIMARY KEY (id_mapel)
+  `
+  );
+
+  const [updateResult] = await conn.query(
+    `
+    UPDATE soal_tryout st
+    JOIN tmp_soal_stats ss
+      ON ss.id_tryout = st.id_tryout
+     AND ss.id_mapel = st.id_mapel
+     AND ss.no_soal = st.no_soal
+    JOIN tmp_mapel_totals mt
+      ON mt.id_mapel = st.id_mapel
+    SET st.point = CASE
+      WHEN mt.raw_total > 0 THEN (
+        CASE
+          WHEN ss.attempts <= 0 THEN 0.5
+          ELSE 1 - (ss.benar / ss.attempts)
+        END / mt.raw_total
+      ) * ?
+      ELSE (? / mt.soal_count)
+    END
+    WHERE st.id_tryout = ?
+  `,
+    [targetTotal, targetTotal, idTryout]
+  );
+
+  return { updatedRows: updateResult.affectedRows || 0, mapelCount: mapels.length };
+}
+
 app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
   try {
     const { id_tryout } = req.params;
@@ -96,6 +223,12 @@ app.post("/process-tryout", async (req, res) => {
   try {
     await conn.beginTransaction();
 
+    await buildLatestJawabanTempTable(conn, idTryout);
+
+    // 0. Auto set bobot soal berbasis performa user (benar/salah).
+    // Bobot per mapel dinormalisasi pada total 9-10 (set default 9.5).
+    const weightSummary = await autoSetBobotSoalByTryout(conn, idTryout);
+
     // 1. Hapus ranking lama biar tidak dobel
     await conn.query(
       `DELETE FROM rank_tryout_2025 WHERE id_tryout = ?`,
@@ -139,17 +272,7 @@ FROM (
           ELSE 0
         END
       ) ${jenis === 'tka' ? '' : '/ 7'} AS total
-    FROM (
-      SELECT jut.*
-      FROM jawaban_user_tryout jut
-      JOIN (
-        SELECT 
-          MAX(id) AS max_id
-        FROM jawaban_user_tryout
-        WHERE id_tryout = ?
-        GROUP BY id_user, id_tryout, id_mapel, no_soal
-      ) x ON x.max_id = jut.id
-    ) jut
+    FROM tmp_latest_jawaban jut
     JOIN soal_tryout st 
       ON st.no_soal = jut.no_soal
      AND st.id_mapel = jut.id_mapel
@@ -161,7 +284,7 @@ FROM (
 LEFT JOIN userdata u ON u.id_user = r.id_user;
 
   `,
-  [idTryout, jenis, idTryout]
+  [idTryout, jenis]
 );
 
 
@@ -204,7 +327,16 @@ LEFT JOIN userdata u ON u.id_user = r.id_user;
 
     await conn.commit();
     await redis.flushall();
-    res.json({ success: true, message: `Ranking & pembahasan berhasil diproses untuk tryout ${idTryout}` });
+    res.json({
+      success: true,
+      message: `Ranking & pembahasan berhasil diproses untuk tryout ${idTryout}`,
+      auto_weighting: {
+        mapel_processed: weightSummary.mapelCount,
+        soal_updated: weightSummary.updatedRows,
+        total_range: [AUTO_WEIGHT_MIN_TOTAL, AUTO_WEIGHT_MAX_TOTAL],
+        target_total: AUTO_WEIGHT_TARGET_TOTAL,
+      },
+    });
   } catch (err) {
     await conn.rollback();
     console.error(err);
