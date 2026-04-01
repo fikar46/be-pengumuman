@@ -157,13 +157,50 @@ async function autoSetBobotSoalByTryout(conn, idTryout) {
   return { updatedRows: updateResult.affectedRows || 0, mapelCount: mapels.length };
 }
 
+async function shouldSkipAutoWeighting(conn, idTryout) {
+  const [rows] = await conn.query(
+    `
+    SELECT
+      COUNT(*) AS total_soal,
+      SUM(CASE WHEN point IS NOT NULL AND point > 0 THEN 1 ELSE 0 END) AS soal_berbobot
+    FROM soal_tryout
+    WHERE id_tryout = ?
+  `,
+    [idTryout]
+  );
+
+  if (!rows.length) {
+    return { skip: false, total_soal: 0, soal_berbobot: 0 };
+  }
+
+  const totalSoal = Number(rows[0].total_soal || 0);
+  const soalBerbobot = Number(rows[0].soal_berbobot || 0);
+
+  return {
+    skip: totalSoal > 0 && soalBerbobot === totalSoal,
+    total_soal: totalSoal,
+    soal_berbobot: soalBerbobot,
+  };
+}
+
 app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
+  const startTime = Date.now();
+  const conn = await pool.getConnection();
   try {
     const { id_tryout } = req.params;
 
-    // 1. ambil jawaban_user_permapel
-    const [rows] = await pool.query(
-      "SELECT id_user,peminatan, jawaban_user_permapel FROM jawaban_user_tryout_v2 WHERE id_tryout = ?",
+    // Ambil data terbaru per user+mapel agar volume parse lebih kecil.
+    const [rows] = await conn.query(
+      `
+      SELECT v.id_user, v.peminatan, v.jawaban_user_permapel
+      FROM jawaban_user_tryout_v2 v
+      JOIN (
+        SELECT MAX(id) AS max_id
+        FROM jawaban_user_tryout_v2
+        WHERE id_tryout = ?
+        GROUP BY id_user, id_tryout, id_mapel
+      ) x ON x.max_id = v.id
+    `,
       [id_tryout]
     );
 
@@ -194,10 +231,6 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
       return res.status(400).json({ success: false, message: "Tidak ada jawaban valid" });
     }
 
-    await pool.query(
-      `DELETE FROM jawaban_user_tryout WHERE id_tryout = ?`,
-      [id_tryout]
-    );
     // 3. mapping untuk bulk insert
     const values = allJawaban.map(j => [
       j.id_user,
@@ -209,22 +242,44 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
       j.peminatan?.replace(/"/g, "")
     ]);
 
+    await conn.beginTransaction();
+    await conn.query(
+      `DELETE FROM jawaban_user_tryout WHERE id_tryout = ?`,
+      [id_tryout]
+    );
+
     const sql = `
-      INSERT INTO jawaban_user_tryout 
-      (id_user, id_tryout, id_mapel, no_soal, status, jawaban, peminatan)
-      VALUES ?
+    INSERT INTO jawaban_user_tryout 
+    (id_user, id_tryout, id_mapel, no_soal, status, jawaban, peminatan)
+    VALUES ?
     `;
 
-    // 4. bulk insert
-    const [result] = await pool.query(sql, [values]);
+    // Insert per chunk untuk menghindari packet/query terlalu besar.
+    const CHUNK_SIZE = 3000;
+    let inserted = 0;
+    for (let i = 0; i < values.length; i += CHUNK_SIZE) {
+      const chunk = values.slice(i, i + CHUNK_SIZE);
+      const [result] = await conn.query(sql, [chunk]);
+      inserted += result.affectedRows || 0;
+    }
+
+    await conn.commit();
 
     res.json({
       success: true,
-      inserted: result.affectedRows
+      inserted,
+      timing_ms: Date.now() - startTime
     });
   } catch (err) {
+    try {
+      await conn.rollback();
+    } catch (rollbackErr) {
+      console.error("Rollback error:", rollbackErr);
+    }
     console.error("Bulk insert error:", err);
     res.status(500).json({ success: false, error: err.message });
+  } finally {
+    conn.release();
   }
 });
 
@@ -232,23 +287,58 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
 app.post("/process-tryout", async (req, res) => {
   const { idTryout,jenis } = req.body;
   const conn = await pool.getConnection();
+  const processStart = Date.now();
+  const timings = {};
+  const mark = (name, startAt) => {
+    timings[name] = Date.now() - startAt;
+  };
 
   try {
+    let stepStart = Date.now();
     await conn.beginTransaction();
+    mark("begin_transaction_ms", stepStart);
 
+    stepStart = Date.now();
     await buildLatestJawabanTempTable(conn, idTryout);
+    mark("build_tmp_latest_jawaban_ms", stepStart);
 
     // 0. Auto set bobot soal berbasis performa user (benar/salah).
     // Bobot per mapel dinormalisasi pada total 9-10 (set default 9.5).
-    const weightSummary = await autoSetBobotSoalByTryout(conn, idTryout);
+    stepStart = Date.now();
+    const weightGuard = await shouldSkipAutoWeighting(conn, idTryout);
+    let weightSummary = {
+      updatedRows: 0,
+      mapelCount: 0,
+      skipped: false,
+      reason: null,
+      guard: weightGuard,
+    };
+
+    if (!weightGuard.skip) {
+      const autoWeightResult = await autoSetBobotSoalByTryout(conn, idTryout);
+      weightSummary = {
+        ...weightSummary,
+        ...autoWeightResult,
+      };
+    } else {
+      weightSummary = {
+        ...weightSummary,
+        skipped: true,
+        reason: "all_soal_already_weighted",
+      };
+    }
+    mark("auto_weighting_ms", stepStart);
 
     // 1. Hapus ranking lama biar tidak dobel
+    stepStart = Date.now();
     await conn.query(
       `DELETE FROM rank_tryout_2025 WHERE id_tryout = ?`,
       [idTryout]
     );
+    mark("delete_old_rank_ms", stepStart);
 
     // 2. Hitung nilai + ranking (pakai CTE + ROW_NUMBER)
+stepStart = Date.now();
 await conn.query(
   `
   INSERT INTO rank_tryout_2025
@@ -299,8 +389,10 @@ LEFT JOIN userdata u ON u.id_user = r.id_user;
   `,
   [idTryout, jenis]
 );
+mark("insert_rank_ms", stepStart);
 
 
+    stepStart = Date.now();
     await conn.query(
       `delete
       FROM jawaban_user_tryout_pembahasan 
@@ -308,18 +400,21 @@ LEFT JOIN userdata u ON u.id_user = r.id_user;
     `,
       [idTryout]
     );
+    mark("delete_pembahasan_ms", stepStart);
     
     // 3. Copy jawaban user ke tabel pembahasan
+    stepStart = Date.now();
     await conn.query(
       `
       INSERT INTO jawaban_user_tryout_pembahasan 
           (id_user,id_tryout,id_mapel,no_soal, status, jawaban,peminatan)
       SELECT id_user,id_tryout,id_mapel,no_soal, status,jawaban,peminatan
-      FROM jawaban_user_tryout 
-      WHERE id_tryout = ?
+      FROM tmp_latest_jawaban
     `,
-      [idTryout]
     );
+    mark("insert_pembahasan_ms", stepStart);
+
+    stepStart = Date.now();
      await conn.query(
       `delete
       FROM jawaban_user_tryout_pembahasan_v2 
@@ -327,19 +422,35 @@ LEFT JOIN userdata u ON u.id_user = r.id_user;
     `,
       [idTryout]
     );
+    mark("delete_pembahasan_v2_ms", stepStart);
+
+    stepStart = Date.now();
     await conn.query(
       `
       INSERT INTO jawaban_user_tryout_pembahasan_v2 
           (id,id_user,id_tryout,id_mapel,jawaban_user_permapel,peminatan,kosong,salah,benar)
-      SELECT id,id_user,id_tryout,id_mapel,jawaban_user_permapel,peminatan,kosong,salah,benar
-      FROM jawaban_user_tryout_v2 
-      WHERE id_tryout = ?
+      SELECT v.id,v.id_user,v.id_tryout,v.id_mapel,v.jawaban_user_permapel,v.peminatan,v.kosong,v.salah,v.benar
+      FROM jawaban_user_tryout_v2 v
+      JOIN (
+        SELECT MAX(id) AS max_id
+        FROM jawaban_user_tryout_v2
+        WHERE id_tryout = ?
+        GROUP BY id_user, id_tryout, id_mapel
+      ) x ON x.max_id = v.id
     `,
       [idTryout]
     );
+    mark("insert_pembahasan_v2_ms", stepStart);
 
+    stepStart = Date.now();
     await conn.commit();
-    await redis.flushall();
+    mark("commit_ms", stepStart);
+
+    stepStart = Date.now();
+    await redis.flushdb("ASYNC");
+    mark("redis_flushdb_async_call_ms", stepStart);
+
+    timings.total_process_ms = Date.now() - processStart;
     res.json({
       success: true,
       message: `Ranking & pembahasan berhasil diproses untuk tryout ${idTryout}`,
@@ -348,7 +459,11 @@ LEFT JOIN userdata u ON u.id_user = r.id_user;
         soal_updated: weightSummary.updatedRows,
         total_range: [AUTO_WEIGHT_MIN_TOTAL, AUTO_WEIGHT_MAX_TOTAL],
         target_total: AUTO_WEIGHT_TARGET_TOTAL,
+        skipped: weightSummary.skipped,
+        reason: weightSummary.reason,
+        guard: weightSummary.guard,
       },
+      timings,
     });
   } catch (err) {
     await conn.rollback();
