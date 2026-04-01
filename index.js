@@ -17,7 +17,7 @@ const pool = mysql.createPool({
   queueLimit: 0,
 });
 
-const AUTO_WEIGHT_MIN_TOTAL = 9;
+const AUTO_WEIGHT_MIN_TOTAL = 9.5;
 const AUTO_WEIGHT_MAX_TOTAL = 10;
 const AUTO_WEIGHT_TARGET_TOTAL = 9.5;
 
@@ -62,11 +62,6 @@ async function autoSetBobotSoalByTryout(conn, idTryout) {
   if (!mapels.length) {
     return { updatedRows: 0, mapelCount: 0 };
   }
-  const targetTotal = Math.min(
-    AUTO_WEIGHT_MAX_TOTAL,
-    Math.max(AUTO_WEIGHT_MIN_TOTAL, AUTO_WEIGHT_TARGET_TOTAL)
-  );
-
   await conn.query(`DROP TEMPORARY TABLE IF EXISTS tmp_soal_stats`);
   await conn.query(
     `
@@ -101,6 +96,12 @@ async function autoSetBobotSoalByTryout(conn, idTryout) {
     SELECT
       id_mapel,
       COUNT(*) AS soal_count,
+      AVG(
+        CASE
+          WHEN attempts <= 0 THEN 0.5
+          ELSE 1 - (benar / attempts)
+        END
+      ) AS avg_raw,
       SUM(
         CASE
           WHEN attempts <= 0 THEN 0.5
@@ -133,12 +134,24 @@ async function autoSetBobotSoalByTryout(conn, idTryout) {
           WHEN ss.attempts <= 0 THEN 0.5
           ELSE 1 - (ss.benar / ss.attempts)
         END / mt.raw_total
-      ) * ?
-      ELSE (? / mt.soal_count)
+      ) * (
+        LEAST(?, GREATEST(?, ? + (0.5 * COALESCE(mt.avg_raw, 0.5))))
+      )
+      ELSE (
+        LEAST(?, GREATEST(?, ? + (0.5 * COALESCE(mt.avg_raw, 0.5)))) / mt.soal_count
+      )
     END
     WHERE st.id_tryout = ?
   `,
-    [targetTotal, targetTotal, idTryout]
+    [
+      AUTO_WEIGHT_MAX_TOTAL,
+      AUTO_WEIGHT_MIN_TOTAL,
+      AUTO_WEIGHT_TARGET_TOTAL,
+      AUTO_WEIGHT_MAX_TOTAL,
+      AUTO_WEIGHT_MIN_TOTAL,
+      AUTO_WEIGHT_TARGET_TOTAL,
+      idTryout
+    ]
   );
 
   return { updatedRows: updateResult.affectedRows || 0, mapelCount: mapels.length };
