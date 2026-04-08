@@ -474,6 +474,267 @@ mark("insert_rank_ms", stepStart);
   }
 });
 
+// 🚀 API untuk proses pengumuman per-user (versi ringan untuk halaman user)
+app.post("/process-tryout-user", async (req, res) => {
+  const { idTryout, idUser, jenis } = req.body;
+
+  if (!idTryout || !idUser) {
+    return res.status(400).json({
+      success: false,
+      message: "idTryout dan idUser wajib diisi",
+    });
+  }
+
+  const conn = await pool.getConnection();
+  const processStart = Date.now();
+  const timings = {};
+  const mark = (name, startAt) => {
+    timings[name] = Date.now() - startAt;
+  };
+
+  try {
+    let stepStart = Date.now();
+    await conn.beginTransaction();
+    mark("begin_transaction_ms", stepStart);
+
+    // 1) Ambil jawaban terbaru per-mapel untuk user ini dari tabel v2
+    stepStart = Date.now();
+    const [latestV2Rows] = await conn.query(
+      `
+      SELECT v.*
+      FROM jawaban_user_tryout_v2 v
+      JOIN (
+        SELECT MAX(id) AS max_id
+        FROM jawaban_user_tryout_v2
+        WHERE id_tryout = ? AND id_user = ?
+        GROUP BY id_user, id_tryout, id_mapel
+      ) x ON x.max_id = v.id
+      `,
+      [idTryout, idUser]
+    );
+    mark("fetch_latest_v2_ms", stepStart);
+
+    if (!latestV2Rows.length) {
+      await conn.rollback();
+      return res.status(404).json({
+        success: false,
+        message: "Jawaban user untuk tryout ini tidak ditemukan",
+      });
+    }
+
+    // 2) Parse JSON jawaban per-mapel jadi bentuk jawaban detail
+    stepStart = Date.now();
+    const parsedJawaban = [];
+    latestV2Rows.forEach((row) => {
+      try {
+        const arr = JSON.parse(row.jawaban_user_permapel || "[]");
+        if (!Array.isArray(arr)) return;
+        arr.forEach((item) => {
+          parsedJawaban.push([
+            Number(idUser),
+            Number(idTryout),
+            Number(item.id_mapel),
+            Number(item.no_soal),
+            (item.status || "").toString().replace(/"/g, ""),
+            (item.jawaban || "").toString().replace(/"/g, ""),
+            (item.peminatan || row.peminatan || "").toString().replace(/"/g, ""),
+          ]);
+        });
+      } catch (e) {
+        // skip row JSON invalid
+      }
+    });
+    mark("parse_jawaban_ms", stepStart);
+
+    if (!parsedJawaban.length) {
+      await conn.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Format jawaban user tidak valid",
+      });
+    }
+
+    // 3) Refresh tabel jawaban detail untuk user ini saja
+    stepStart = Date.now();
+    await conn.query(
+      `DELETE FROM jawaban_user_tryout WHERE id_tryout = ? AND id_user = ?`,
+      [idTryout, idUser]
+    );
+    await conn.query(
+      `
+      INSERT INTO jawaban_user_tryout
+      (id_user, id_tryout, id_mapel, no_soal, status, jawaban, peminatan)
+      VALUES ?
+      `,
+      [parsedJawaban]
+    );
+    mark("refresh_jawaban_detail_ms", stepStart);
+
+    // 4) Refresh tabel pembahasan detail untuk user ini saja
+    stepStart = Date.now();
+    await conn.query(
+      `DELETE FROM jawaban_user_tryout_pembahasan WHERE id_tryout = ? AND id_user = ?`,
+      [idTryout, idUser]
+    );
+    await conn.query(
+      `
+      INSERT INTO jawaban_user_tryout_pembahasan
+      (id_user, id_tryout, id_mapel, no_soal, status, jawaban, peminatan)
+      VALUES ?
+      `,
+      [parsedJawaban]
+    );
+    mark("refresh_pembahasan_ms", stepStart);
+
+    // 5) Refresh pembahasan_v2 untuk user ini saja
+    stepStart = Date.now();
+    await conn.query(
+      `DELETE FROM jawaban_user_tryout_pembahasan_v2 WHERE id_tryout = ? AND id_user = ?`,
+      [idTryout, idUser]
+    );
+    await conn.query(
+      `
+      INSERT INTO jawaban_user_tryout_pembahasan_v2
+      (id, id_user, id_tryout, id_mapel, jawaban_user_permapel, peminatan, kosong, salah, benar)
+      SELECT id, id_user, id_tryout, id_mapel, jawaban_user_permapel, peminatan, kosong, salah, benar
+      FROM jawaban_user_tryout_v2
+      WHERE id IN (${latestV2Rows.map(() => "?").join(",")})
+      `,
+      latestV2Rows.map((x) => x.id)
+    );
+    mark("refresh_pembahasan_v2_ms", stepStart);
+
+    // 6) Hitung total user (tanpa proses massal semua peserta)
+    stepStart = Date.now();
+    const [scoreRows] = await conn.query(
+      `
+      SELECT
+        ju.id_user,
+        COALESCE(SUM(
+          CASE
+            WHEN ju.status = 'benar' THEN
+              CASE
+                WHEN ? = 'tka' THEN 5
+                ELSE st.point * 100
+              END
+            ELSE 0
+          END
+        ), 0) AS raw_total,
+        COALESCE(MAX(NULLIF(ju.peminatan, '')), 'Saintek') AS peminatan
+      FROM jawaban_user_tryout ju
+      JOIN soal_tryout st
+        ON st.no_soal = ju.no_soal
+       AND st.id_mapel = ju.id_mapel
+       AND st.id_tryout = ju.id_tryout
+      WHERE ju.id_tryout = ? AND ju.id_user = ?
+      GROUP BY ju.id_user
+      `,
+      [jenis || "", idTryout, idUser]
+    );
+    mark("calculate_score_ms", stepStart);
+
+    if (!scoreRows.length) {
+      await conn.rollback();
+      return res.status(404).json({
+        success: false,
+        message: "Nilai user tidak dapat dihitung",
+      });
+    }
+
+    const rawTotal = Number(scoreRows[0].raw_total || 0);
+    const userPeminatan = scoreRows[0].peminatan || "Saintek";
+    const finalTotal = (jenis || "").toLowerCase() === "tka" ? rawTotal : rawTotal / 7;
+
+    // 7) Upsert ranking user ke rank_tryout_2025
+    stepStart = Date.now();
+    const [userRows] = await conn.query(
+      `
+      SELECT u.id, u.username, ud.instansi, ud.provinsi
+      FROM users u
+      LEFT JOIN userdata ud ON ud.id_user = u.id
+      WHERE u.id = ?
+      LIMIT 1
+      `,
+      [idUser]
+    );
+    if (!userRows.length) {
+      await conn.rollback();
+      return res.status(404).json({
+        success: false,
+        message: "Data user tidak ditemukan",
+      });
+    }
+
+    await conn.query(
+      `DELETE FROM rank_tryout_2025 WHERE id_tryout = ? AND id_user = ?`,
+      [idTryout, idUser]
+    );
+    await conn.query(
+      `
+      INSERT INTO rank_tryout_2025
+      (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2026)
+      `,
+      [
+        Number(idUser),
+        userRows[0].username || "",
+        userPeminatan,
+        finalTotal,
+        userRows[0].instansi || null,
+        userRows[0].provinsi || null,
+        0,
+        Number(idTryout),
+      ]
+    );
+    mark("upsert_rank_ms", stepStart);
+
+    // 8) Hitung rank user berdasarkan data rank yang sudah ada
+    stepStart = Date.now();
+    const [rankRows] = await conn.query(
+      `
+      SELECT COUNT(*) + 1 AS rank_position
+      FROM rank_tryout_2025
+      WHERE id_tryout = ? AND total > ?
+      `,
+      [idTryout, finalTotal]
+    );
+    const userRank = Number(rankRows?.[0]?.rank_position || 1);
+
+    await conn.query(
+      `UPDATE rank_tryout_2025 SET \`rank\` = ? WHERE id_tryout = ? AND id_user = ?`,
+      [userRank, idTryout, idUser]
+    );
+    mark("update_user_rank_ms", stepStart);
+
+    stepStart = Date.now();
+    await conn.commit();
+    mark("commit_ms", stepStart);
+
+    timings.total_process_ms = Date.now() - processStart;
+    return res.json({
+      success: true,
+      message: `Pengumuman user ${idUser} untuk tryout ${idTryout} berhasil diproses`,
+      data: {
+        idTryout: Number(idTryout),
+        idUser: Number(idUser),
+        total: finalTotal,
+        rank: userRank,
+      },
+      timings,
+    });
+  } catch (err) {
+    try {
+      await conn.rollback();
+    } catch (rollbackErr) {
+      console.error("Rollback error:", rollbackErr);
+    }
+    console.error(err);
+    return res.status(500).json({ success: false, error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
 
 app.post("/delete-jawaban-pembahasan", async (req, res) => {
   const { idTryout } = req.body;
