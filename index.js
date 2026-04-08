@@ -21,6 +21,40 @@ const AUTO_WEIGHT_MIN_TOTAL = 9.5;
 const AUTO_WEIGHT_MAX_TOTAL = 10;
 const AUTO_WEIGHT_TARGET_TOTAL = 9.5;
 
+async function deleteRedisKeysByPatterns(patterns = []) {
+  const keySet = new Set();
+
+  for (const pattern of patterns) {
+    let cursor = "0";
+    do {
+      const [nextCursor, keys] = await redis.scan(
+        cursor,
+        "MATCH",
+        pattern,
+        "COUNT",
+        200
+      );
+      cursor = nextCursor;
+      (keys || []).forEach((key) => keySet.add(key));
+    } while (cursor !== "0");
+  }
+
+  const allKeys = Array.from(keySet);
+  if (!allKeys.length) {
+    return { deleted: 0 };
+  }
+
+  const CHUNK_SIZE = 500;
+  let deleted = 0;
+  for (let i = 0; i < allKeys.length; i += CHUNK_SIZE) {
+    const chunk = allKeys.slice(i, i + CHUNK_SIZE);
+    const result = await redis.del(...chunk);
+    deleted += Number(result || 0);
+  }
+
+  return { deleted };
+}
+
 async function buildLatestJawabanTempTable(conn, idTryout) {
   await conn.query(`DROP TEMPORARY TABLE IF EXISTS tmp_latest_jawaban`);
   await conn.query(
@@ -710,6 +744,17 @@ app.post("/process-tryout-user", async (req, res) => {
     await conn.commit();
     mark("commit_ms", stepStart);
 
+    // 9) Invalidate cache yang terkait halaman pengumuman user ini saja
+    stepStart = Date.now();
+    const cacheClear = await deleteRedisKeysByPatterns([
+      `nilaitosaintek_${idTryout}_${idUser}_*`,
+      `nilaitososhum_${idTryout}_${idUser}_*`,
+      `nilaitoipc_${idTryout}_${idUser}_*`,
+      `status_pengumuman_to_${idTryout}_${idUser}_*`,
+      `check_rank_per_tryout_${idTryout}_${idUser}*`,
+    ]);
+    mark("clear_related_cache_ms", stepStart);
+
     timings.total_process_ms = Date.now() - processStart;
     return res.json({
       success: true,
@@ -719,6 +764,7 @@ app.post("/process-tryout-user", async (req, res) => {
         idUser: Number(idUser),
         total: finalTotal,
         rank: userRank,
+        deleted_cache_keys: cacheClear.deleted,
       },
       timings,
     });
