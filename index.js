@@ -389,75 +389,114 @@ app.post("/process-tryout", async (req, res) => {
     mark("delete_old_rank_ms", stepStart);
 
     // 2. Hitung nilai + ranking
-    // Kedinasan/SKD: benar*5, kecuali id_mapel=69 tetap benar*1 (sesuai SQL lama)
     stepStart = Date.now();
-    await conn.query(
-      `
-      INSERT INTO rank_tryout_2025
-      (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year)
-      SELECT
-        r.id_user,
-        r.username,
-        r.peminatan,
-        r.total,
-        ud.instansi,
-        ud.provinsi,
-        r.rnk,
-        ?,
-        2026
-      FROM (
+    if (isKedinasan) {
+      // Kedinasan: TWK/TIU = benar*5, TKP(id_mapel=69) = skor TKP langsung (kolom benar)
+      await conn.query(
+        `
+        INSERT INTO rank_tryout_2025
+        (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year)
         SELECT
-          n.id_user,
-          n.username,
-          n.peminatan,
-          n.total,
-          ROW_NUMBER() OVER (ORDER BY n.total DESC) AS rnk
+          r.id_user,
+          r.username,
+          r.peminatan,
+          r.total,
+          ud.instansi,
+          ud.provinsi,
+          r.rnk,
+          ?,
+          2026
         FROM (
           SELECT
-            jut.id_user,
-            u.username,
-            COALESCE(
-              MAX(NULLIF(jut.peminatan, '')),
-              CASE
-                WHEN ? IN ('kedinasan', 'cpns', 'skd') THEN 'ipc'
-                ELSE 'Saintek'
-              END
-            ) AS peminatan,
-            (
+            n.id_user,
+            n.username,
+            n.peminatan,
+            n.total,
+            ROW_NUMBER() OVER (ORDER BY n.total DESC) AS rnk
+          FROM (
+            SELECT
+              v.id_user,
+              u.username,
+              COALESCE(MAX(NULLIF(v.peminatan, '')), 'ipc') AS peminatan,
               SUM(
                 CASE
-                  WHEN jut.status = 'benar' THEN
-                    CASE
-                      WHEN ? = 'tka' THEN 5
-                      WHEN ? IN ('kedinasan', 'cpns', 'skd') THEN
-                        CASE
-                          WHEN jut.id_mapel = 69 THEN 1
-                          ELSE 5
-                        END
-                      ELSE st.point * 100
-                    END
-                  ELSE 0
+                  WHEN v.id_mapel = 69 THEN COALESCE(v.benar, 0)
+                  ELSE COALESCE(v.benar, 0) * 5
                 END
-              )
-            ) / (
-              CASE
-                WHEN ? IN ('tka', 'kedinasan', 'cpns', 'skd') THEN 1
-                ELSE 7
-              END
-            ) AS total
-          FROM tmp_latest_jawaban jut
-          JOIN soal_tryout st
-            ON st.no_soal = jut.no_soal
-           AND st.id_mapel = jut.id_mapel
-           AND st.id_tryout = jut.id_tryout
-          JOIN users u ON u.id = jut.id_user
-          GROUP BY jut.id_user, u.username
-        ) n
-      ) r
-      LEFT JOIN userdata ud ON ud.id_user = r.id_user;
-      `,
-      [idTryout, normalizedJenis, normalizedJenis, normalizedJenis, normalizedJenis]
-    );
+              ) AS total
+            FROM jawaban_user_tryout_v2 v
+            JOIN (
+              SELECT MAX(id) AS max_id
+              FROM jawaban_user_tryout_v2
+              WHERE id_tryout = ?
+              GROUP BY id_user, id_tryout, id_mapel
+            ) x ON x.max_id = v.id
+            JOIN users u ON u.id = v.id_user
+            GROUP BY v.id_user, u.username
+          ) n
+        ) r
+        LEFT JOIN userdata ud ON ud.id_user = r.id_user;
+        `,
+        [idTryout, idTryout]
+      );
+    } else {
+      await conn.query(
+        `
+        INSERT INTO rank_tryout_2025
+        (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year)
+        SELECT
+          r.id_user,
+          r.username,
+          r.peminatan,
+          r.total,
+          ud.instansi,
+          ud.provinsi,
+          r.rnk,
+          ?,
+          2026
+        FROM (
+          SELECT
+            n.id_user,
+            n.username,
+            n.peminatan,
+            n.total,
+            ROW_NUMBER() OVER (ORDER BY n.total DESC) AS rnk
+          FROM (
+            SELECT
+              jut.id_user,
+              u.username,
+              COALESCE(MAX(NULLIF(jut.peminatan, '')), 'Saintek') AS peminatan,
+              (
+                SUM(
+                  CASE
+                    WHEN jut.status = 'benar' THEN
+                      CASE
+                        WHEN ? = 'tka' THEN 5
+                        ELSE st.point * 100
+                      END
+                    ELSE 0
+                  END
+                )
+              ) / (
+                CASE
+                  WHEN ? = 'tka' THEN 1
+                  ELSE 7
+                END
+              ) AS total
+            FROM tmp_latest_jawaban jut
+            JOIN soal_tryout st
+              ON st.no_soal = jut.no_soal
+             AND st.id_mapel = jut.id_mapel
+             AND st.id_tryout = jut.id_tryout
+            JOIN users u ON u.id = jut.id_user
+            GROUP BY jut.id_user, u.username
+          ) n
+        ) r
+        LEFT JOIN userdata ud ON ud.id_user = r.id_user;
+        `,
+        [idTryout, normalizedJenis, normalizedJenis]
+      );
+    }
     mark("insert_rank_ms", stepStart);
 
 
@@ -677,42 +716,54 @@ app.post("/process-tryout-user", async (req, res) => {
 
     // 6) Hitung total user (tanpa proses massal semua peserta)
     stepStart = Date.now();
-    const [scoreRows] = await conn.query(
-      `
-      SELECT
-        ju.id_user,
-        COALESCE(SUM(
-          CASE
-            WHEN ju.status = 'benar' THEN
+    const [scoreRows] = isKedinasan
+      ? await conn.query(
+          `
+          SELECT
+            v.id_user,
+            COALESCE(SUM(
               CASE
-                WHEN ? = 'tka' THEN 5
-                WHEN ? IN ('kedinasan', 'cpns', 'skd') THEN
-                  CASE
-                    WHEN ju.id_mapel = 69 THEN 1
-                    ELSE 5
-                  END
-                ELSE st.point * 100
+                WHEN v.id_mapel = 69 THEN COALESCE(v.benar, 0)
+                ELSE COALESCE(v.benar, 0) * 5
               END
-            ELSE 0
-          END
-        ), 0) AS raw_total,
-        COALESCE(
-          MAX(NULLIF(ju.peminatan, '')),
-          CASE
-            WHEN ? IN ('kedinasan', 'cpns', 'skd') THEN 'ipc'
-            ELSE 'Saintek'
-          END
-        ) AS peminatan
-      FROM jawaban_user_tryout ju
-      JOIN soal_tryout st
-        ON st.no_soal = ju.no_soal
-       AND st.id_mapel = ju.id_mapel
-       AND st.id_tryout = ju.id_tryout
-      WHERE ju.id_tryout = ? AND ju.id_user = ?
-      GROUP BY ju.id_user
-      `,
-      [normalizedJenis, normalizedJenis, normalizedJenis, idTryout, idUser]
-    );
+            ), 0) AS raw_total,
+            COALESCE(MAX(NULLIF(v.peminatan, '')), 'ipc') AS peminatan
+          FROM jawaban_user_tryout_v2 v
+          JOIN (
+            SELECT MAX(id) AS max_id
+            FROM jawaban_user_tryout_v2
+            WHERE id_tryout = ? AND id_user = ?
+            GROUP BY id_user, id_tryout, id_mapel
+          ) x ON x.max_id = v.id
+          GROUP BY v.id_user
+          `,
+          [idTryout, idUser]
+        )
+      : await conn.query(
+          `
+          SELECT
+            ju.id_user,
+            COALESCE(SUM(
+              CASE
+                WHEN ju.status = 'benar' THEN
+                  CASE
+                    WHEN ? = 'tka' THEN 5
+                    ELSE st.point * 100
+                  END
+                ELSE 0
+              END
+            ), 0) AS raw_total,
+            COALESCE(MAX(NULLIF(ju.peminatan, '')), 'Saintek') AS peminatan
+          FROM jawaban_user_tryout ju
+          JOIN soal_tryout st
+            ON st.no_soal = ju.no_soal
+           AND st.id_mapel = ju.id_mapel
+           AND st.id_tryout = ju.id_tryout
+          WHERE ju.id_tryout = ? AND ju.id_user = ?
+          GROUP BY ju.id_user
+          `,
+          [normalizedJenis, idTryout, idUser]
+        );
     mark("calculate_score_ms", stepStart);
 
     if (!scoreRows.length) {
