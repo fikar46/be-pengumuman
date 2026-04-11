@@ -21,6 +21,15 @@ const AUTO_WEIGHT_MIN_TOTAL = 9.5;
 const AUTO_WEIGHT_MAX_TOTAL = 10;
 const AUTO_WEIGHT_TARGET_TOTAL = 9.5;
 
+function normalizeJenis(jenis = "") {
+  return (jenis || "").toString().trim().toLowerCase();
+}
+
+function isKedinasanJenis(jenis = "") {
+  const normalized = normalizeJenis(jenis);
+  return normalized === "kedinasan" || normalized === "cpns" || normalized === "skd";
+}
+
 async function deleteRedisKeysByPatterns(patterns = []) {
   const keySet = new Set();
 
@@ -322,6 +331,8 @@ app.post("/process-tryout", async (req, res) => {
   const { idTryout,jenis } = req.body;
   const conn = await pool.getConnection();
   const processStart = Date.now();
+  const normalizedJenis = normalizeJenis(jenis);
+  const isKedinasan = isKedinasanJenis(normalizedJenis);
   const timings = {};
   const mark = (name, startAt) => {
     timings[name] = Date.now() - startAt;
@@ -348,7 +359,13 @@ app.post("/process-tryout", async (req, res) => {
       guard: weightGuard,
     };
 
-    if (!weightGuard.skip) {
+    if (isKedinasan) {
+      weightSummary = {
+        ...weightSummary,
+        skipped: true,
+        reason: "not_required_for_kedinasan",
+      };
+    } else if (!weightGuard.skip) {
       const autoWeightResult = await autoSetBobotSoalByTryout(conn, idTryout);
       weightSummary = {
         ...weightSummary,
@@ -371,59 +388,77 @@ app.post("/process-tryout", async (req, res) => {
     );
     mark("delete_old_rank_ms", stepStart);
 
-    // 2. Hitung nilai + ranking (pakai CTE + ROW_NUMBER)
-stepStart = Date.now();
-await conn.query(
-  `
-  INSERT INTO rank_tryout_2025
-(id_user, username, peminatan, total, instansi, provinsi,  \`rank\`, id_tryout, year)
-SELECT
-  r.id_user,
-  r.username,
-  r.peminatan,
-  r.total,
-  u.instansi,
-  u.provinsi,
-  r.rnk,
-  ?,
-  2026
-FROM (
-  SELECT 
-    n.id_user,
-    n.username,
-    n.peminatan,
-    n.total,
-    ROW_NUMBER() OVER (ORDER BY n.total DESC) AS rnk
-  FROM (
-    SELECT 
-      jut.id_user,
-      u.username,
-      jut.peminatan,
-      SUM(
-        CASE 
-          WHEN jut.status = 'benar' THEN 
-            CASE 
-              WHEN ? = 'tka' THEN 5 
-              ELSE st.point * 100 
-            END
-          ELSE 0
-        END
-      ) ${jenis === 'tka' ? '' : '/ 7'} AS total
-    FROM tmp_latest_jawaban jut
-    JOIN soal_tryout st 
-      ON st.no_soal = jut.no_soal
-     AND st.id_mapel = jut.id_mapel
-     AND st.id_tryout = jut.id_tryout
-    JOIN users u ON u.id = jut.id_user
-    GROUP BY jut.id_user, u.username
-  ) n
-) r
-LEFT JOIN userdata u ON u.id_user = r.id_user;
-
-  `,
-  [idTryout, jenis]
-);
-mark("insert_rank_ms", stepStart);
+    // 2. Hitung nilai + ranking
+    // Kedinasan/SKD: benar*5, kecuali id_mapel=69 tetap benar*1 (sesuai SQL lama)
+    stepStart = Date.now();
+    await conn.query(
+      `
+      INSERT INTO rank_tryout_2025
+      (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year)
+      SELECT
+        r.id_user,
+        r.username,
+        r.peminatan,
+        r.total,
+        ud.instansi,
+        ud.provinsi,
+        r.rnk,
+        ?,
+        2026
+      FROM (
+        SELECT
+          n.id_user,
+          n.username,
+          n.peminatan,
+          n.total,
+          ROW_NUMBER() OVER (ORDER BY n.total DESC) AS rnk
+        FROM (
+          SELECT
+            jut.id_user,
+            u.username,
+            COALESCE(
+              MAX(NULLIF(jut.peminatan, '')),
+              CASE
+                WHEN ? IN ('kedinasan', 'cpns', 'skd') THEN 'ipc'
+                ELSE 'Saintek'
+              END
+            ) AS peminatan,
+            (
+              SUM(
+                CASE
+                  WHEN jut.status = 'benar' THEN
+                    CASE
+                      WHEN ? = 'tka' THEN 5
+                      WHEN ? IN ('kedinasan', 'cpns', 'skd') THEN
+                        CASE
+                          WHEN jut.id_mapel = 69 THEN 1
+                          ELSE 5
+                        END
+                      ELSE st.point * 100
+                    END
+                  ELSE 0
+                END
+              )
+            ) / (
+              CASE
+                WHEN ? IN ('tka', 'kedinasan', 'cpns', 'skd') THEN 1
+                ELSE 7
+              END
+            ) AS total
+          FROM tmp_latest_jawaban jut
+          JOIN soal_tryout st
+            ON st.no_soal = jut.no_soal
+           AND st.id_mapel = jut.id_mapel
+           AND st.id_tryout = jut.id_tryout
+          JOIN users u ON u.id = jut.id_user
+          GROUP BY jut.id_user, u.username
+        ) n
+      ) r
+      LEFT JOIN userdata ud ON ud.id_user = r.id_user;
+      `,
+      [idTryout, normalizedJenis, normalizedJenis, normalizedJenis, normalizedJenis]
+    );
+    mark("insert_rank_ms", stepStart);
 
 
     stepStart = Date.now();
@@ -511,6 +546,8 @@ mark("insert_rank_ms", stepStart);
 // 🚀 API untuk proses pengumuman per-user (versi ringan untuk halaman user)
 app.post("/process-tryout-user", async (req, res) => {
   const { idTryout, idUser, jenis } = req.body;
+  const normalizedJenis = normalizeJenis(jenis);
+  const isKedinasan = isKedinasanJenis(normalizedJenis);
 
   if (!idTryout || !idUser) {
     return res.status(400).json({
@@ -649,12 +686,23 @@ app.post("/process-tryout-user", async (req, res) => {
             WHEN ju.status = 'benar' THEN
               CASE
                 WHEN ? = 'tka' THEN 5
+                WHEN ? IN ('kedinasan', 'cpns', 'skd') THEN
+                  CASE
+                    WHEN ju.id_mapel = 69 THEN 1
+                    ELSE 5
+                  END
                 ELSE st.point * 100
               END
             ELSE 0
           END
         ), 0) AS raw_total,
-        COALESCE(MAX(NULLIF(ju.peminatan, '')), 'Saintek') AS peminatan
+        COALESCE(
+          MAX(NULLIF(ju.peminatan, '')),
+          CASE
+            WHEN ? IN ('kedinasan', 'cpns', 'skd') THEN 'ipc'
+            ELSE 'Saintek'
+          END
+        ) AS peminatan
       FROM jawaban_user_tryout ju
       JOIN soal_tryout st
         ON st.no_soal = ju.no_soal
@@ -663,7 +711,7 @@ app.post("/process-tryout-user", async (req, res) => {
       WHERE ju.id_tryout = ? AND ju.id_user = ?
       GROUP BY ju.id_user
       `,
-      [jenis || "", idTryout, idUser]
+      [normalizedJenis, normalizedJenis, normalizedJenis, idTryout, idUser]
     );
     mark("calculate_score_ms", stepStart);
 
@@ -676,8 +724,11 @@ app.post("/process-tryout-user", async (req, res) => {
     }
 
     const rawTotal = Number(scoreRows[0].raw_total || 0);
-    const userPeminatan = scoreRows[0].peminatan || "Saintek";
-    const finalTotal = (jenis || "").toLowerCase() === "tka" ? rawTotal : rawTotal / 7;
+    const userPeminatan = scoreRows[0].peminatan || (isKedinasan ? "ipc" : "Saintek");
+    const finalTotal =
+      normalizedJenis === "tka" || isKedinasan
+        ? rawTotal
+        : rawTotal / 7;
 
     // 7) Upsert ranking user ke rank_tryout_2025
     stepStart = Date.now();
