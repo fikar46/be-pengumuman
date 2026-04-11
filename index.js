@@ -280,9 +280,9 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
       j.id_tryout,
       j.id_mapel,
       j.no_soal,
-      j.status?.replace(/"/g, ""),
-      j.jawaban?.replace(/"/g, ""),
-      j.peminatan?.replace(/"/g, "")
+      (j.status || "").toString().replace(/"/g, ""),
+      (j.jawaban || "").toString().replace(/"/g, ""),
+      (j.peminatan || "").toString().replace(/"/g, "")
     ]);
 
     await conn.beginTransaction();
