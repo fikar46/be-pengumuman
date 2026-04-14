@@ -231,11 +231,16 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const { id_tryout } = req.params;
-
-    // Ambil data terbaru per user+mapel agar volume parse lebih kecil.
-    const [rows] = await conn.query(
+    await conn.query(`DROP TEMPORARY TABLE IF EXISTS tmp_latest_jawaban_v2`);
+    await conn.query(
       `
-      SELECT v.id_user, v.peminatan, v.jawaban_user_permapel
+      CREATE TEMPORARY TABLE tmp_latest_jawaban_v2 AS
+      SELECT
+        v.id_user,
+        v.id_tryout,
+        v.id_mapel,
+        v.peminatan,
+        v.jawaban_user_permapel
       FROM jawaban_user_tryout_v2 v
       JOIN (
         SELECT MAX(id) AS max_id
@@ -243,67 +248,122 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
         WHERE id_tryout = ?
         GROUP BY id_user, id_tryout, id_mapel
       ) x ON x.max_id = v.id
+      WHERE v.id_tryout = ?
     `,
-      [id_tryout]
+      [id_tryout, id_tryout]
     );
 
-    if (rows.length === 0) {
+    const [[sourceStats]] = await conn.query(
+      `
+      SELECT
+        COUNT(*) AS total_rows,
+        SUM(CASE WHEN JSON_VALID(jawaban_user_permapel) = 1 THEN 1 ELSE 0 END) AS valid_json_rows
+      FROM tmp_latest_jawaban_v2
+    `
+    );
+
+    const totalRows = Number(sourceStats?.total_rows || 0);
+    const validJsonRows = Number(sourceStats?.valid_json_rows || 0);
+
+    if (totalRows === 0) {
       return res.status(404).json({ success: false, message: "Data tidak ditemukan" });
     }
 
-    // 2. Parse semua JSON jadi array jawaban
-    
-    let allJawaban = [];
-    rows.forEach(r => {
-      try {
-        const parsed = JSON.parse(r.jawaban_user_permapel);
-        if (Array.isArray(parsed)) {
-          // tambahkan id_user dari tabel luar ke setiap jawaban
-          parsed.forEach(p => {
-            p.id_user = r.id_user;
-            p.peminatan = r.peminatan;
-          });
-          allJawaban.push(...parsed);
-        }
-      } catch (e) {
-        console.error("JSON parse error:", e);
-      }
-    });
-
-    if (allJawaban.length === 0) {
+    if (validJsonRows === 0) {
       return res.status(400).json({ success: false, message: "Tidak ada jawaban valid" });
     }
 
-    // 3. mapping untuk bulk insert
-    const values = allJawaban.map(j => [
-      j.id_user,
-      j.id_tryout,
-      j.id_mapel,
-      j.no_soal,
-      (j.status || "").toString().replace(/"/g, ""),
-      (j.jawaban || "").toString().replace(/"/g, ""),
-      (j.peminatan || "").toString().replace(/"/g, "")
-    ]);
-
     await conn.beginTransaction();
-    await conn.query(
-      `DELETE FROM jawaban_user_tryout WHERE id_tryout = ?`,
-      [id_tryout]
-    );
+    await conn.query(`DELETE FROM jawaban_user_tryout WHERE id_tryout = ?`, [id_tryout]);
 
-    const sql = `
-    INSERT INTO jawaban_user_tryout 
-    (id_user, id_tryout, id_mapel, no_soal, status, jawaban, peminatan)
-    VALUES ?
-    `;
-
-    // Insert per chunk untuk menghindari packet/query terlalu besar.
-    const CHUNK_SIZE = 3000;
     let inserted = 0;
-    for (let i = 0; i < values.length; i += CHUNK_SIZE) {
-      const chunk = values.slice(i, i + CHUNK_SIZE);
-      const [result] = await conn.query(sql, [chunk]);
-      inserted += result.affectedRows || 0;
+    let mode = "json_table";
+    try {
+      const [insertResult] = await conn.query(
+        `
+        INSERT INTO jawaban_user_tryout
+        (id_user, id_tryout, id_mapel, no_soal, status, jawaban, peminatan)
+        SELECT
+          t.id_user,
+          t.id_tryout,
+          t.id_mapel,
+          j.no_soal,
+          REPLACE(COALESCE(j.status, ''), '"', '') AS status,
+          REPLACE(COALESCE(j.jawaban, ''), '"', '') AS jawaban,
+          REPLACE(COALESCE(NULLIF(j.peminatan, ''), t.peminatan, ''), '"', '') AS peminatan
+        FROM tmp_latest_jawaban_v2 t
+        JOIN JSON_TABLE(
+          t.jawaban_user_permapel,
+          '$[*]' COLUMNS (
+            no_soal INT PATH '$.no_soal' NULL ON EMPTY NULL ON ERROR,
+            status VARCHAR(20) PATH '$.status' NULL ON EMPTY NULL ON ERROR,
+            jawaban VARCHAR(255) PATH '$.jawaban' NULL ON EMPTY NULL ON ERROR,
+            peminatan VARCHAR(50) PATH '$.peminatan' NULL ON EMPTY NULL ON ERROR
+          )
+        ) AS j
+        WHERE JSON_VALID(t.jawaban_user_permapel) = 1
+          AND j.no_soal IS NOT NULL
+      `
+      );
+      inserted = insertResult.affectedRows || 0;
+    } catch (insertErr) {
+      // Fallback untuk engine DB yang belum support JSON_TABLE.
+      mode = "js_fallback";
+      const fallbackableCodes = new Set(["ER_PARSE_ERROR", "ER_NOT_SUPPORTED_YET"]);
+      if (!fallbackableCodes.has(insertErr?.code)) {
+        throw insertErr;
+      }
+
+      const [fallbackRows] = await conn.query(
+        `
+        SELECT id_user, id_tryout, id_mapel, peminatan, jawaban_user_permapel
+        FROM tmp_latest_jawaban_v2
+        WHERE JSON_VALID(jawaban_user_permapel) = 1
+      `
+      );
+
+      const values = [];
+      fallbackRows.forEach((row) => {
+        try {
+          const parsed = JSON.parse(row.jawaban_user_permapel);
+          if (!Array.isArray(parsed)) {
+            return;
+          }
+          parsed.forEach((item) => {
+            const noSoal = Number(item?.no_soal);
+            if (!Number.isFinite(noSoal)) {
+              return;
+            }
+            values.push([
+              row.id_user,
+              row.id_tryout,
+              row.id_mapel,
+              noSoal,
+              (item?.status || "").toString().replace(/"/g, ""),
+              (item?.jawaban || "").toString().replace(/"/g, ""),
+              (item?.peminatan || row.peminatan || "").toString().replace(/"/g, "")
+            ]);
+          });
+        } catch (e) {
+          // skip json invalid per baris
+        }
+      });
+
+      if (!values.length) {
+        throw new Error("Tidak ada jawaban valid untuk disimpan");
+      }
+
+      const insertSql = `
+        INSERT INTO jawaban_user_tryout
+        (id_user, id_tryout, id_mapel, no_soal, status, jawaban, peminatan)
+        VALUES ?
+      `;
+      const CHUNK_SIZE = 3000;
+      for (let i = 0; i < values.length; i += CHUNK_SIZE) {
+        const chunk = values.slice(i, i + CHUNK_SIZE);
+        const [chunkResult] = await conn.query(insertSql, [chunk]);
+        inserted += chunkResult.affectedRows || 0;
+      }
     }
 
     await conn.commit();
@@ -311,6 +371,9 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
     res.json({
       success: true,
       inserted,
+      mode,
+      source_rows: totalRows,
+      valid_json_rows: validJsonRows,
       timing_ms: Date.now() - startTime
     });
   } catch (err) {
