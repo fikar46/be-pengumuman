@@ -732,9 +732,10 @@ app.post("/process-tryout-user", async (req, res) => {
     if (!latestV2Rows.length) {
       await conn.rollback();
       logProcessTryoutUser("warn", "latest v2 not found", requestMeta);
-      return res.status(404).json({
+      return res.status(400).json({
         success: false,
-        message: "Jawaban user untuk tryout ini tidak ditemukan",
+        message:
+          "Kamu belum mengerjakan tryout ini, jadi belum bisa akses pengumuman nilai.",
       });
     }
 
@@ -779,8 +780,8 @@ app.post("/process-tryout-user", async (req, res) => {
         success: false,
         message:
           invalidJsonRows.length > 0
-            ? "Format jawaban user tidak valid (JSON jawaban rusak)"
-            : "Format jawaban user tidak valid (jawaban kosong)",
+            ? "Data jawaban tryout tidak valid. Silakan hubungi admin."
+            : "Kamu belum mengerjakan tryout ini, jadi belum bisa akses pengumuman nilai.",
       });
     }
 
@@ -892,9 +893,10 @@ app.post("/process-tryout-user", async (req, res) => {
         ...requestMeta,
         parsedJawabanCount: parsedJawaban.length,
       });
-      return res.status(404).json({
+      return res.status(400).json({
         success: false,
-        message: "Nilai user tidak dapat dihitung",
+        message:
+          "Kamu belum mengerjakan tryout ini, jadi belum bisa akses pengumuman nilai.",
       });
     }
 
