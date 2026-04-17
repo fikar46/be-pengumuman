@@ -4,6 +4,22 @@ import Redis from "ioredis";
 
 const app = express();
 app.use(express.json());
+app.use((err, req, res, next) => {
+  if (err && err.type === "entity.parse.failed") {
+    console.error("[process-tryout-user] invalid JSON payload", {
+      at: new Date().toISOString(),
+      path: req.originalUrl,
+      method: req.method,
+      ip: req.ip,
+      error: err.message,
+    });
+    return res.status(400).json({
+      success: false,
+      message: "Payload JSON tidak valid",
+    });
+  }
+  next(err);
+});
 const redis = new Redis();
 
 // koneksi pool database
@@ -28,6 +44,22 @@ function normalizeJenis(jenis = "") {
 function isKedinasanJenis(jenis = "") {
   const normalized = normalizeJenis(jenis);
   return normalized === "kedinasan" || normalized === "cpns" || normalized === "skd";
+}
+
+function logProcessTryoutUser(level = "info", message = "", context = {}) {
+  const payload = {
+    at: new Date().toISOString(),
+    ...context,
+  };
+  if (level === "error") {
+    console.error(`[process-tryout-user] ${message}`, payload);
+    return;
+  }
+  if (level === "warn") {
+    console.warn(`[process-tryout-user] ${message}`, payload);
+    return;
+  }
+  console.log(`[process-tryout-user] ${message}`, payload);
 }
 
 async function deleteRedisKeysByPatterns(patterns = []) {
@@ -650,8 +682,18 @@ app.post("/process-tryout-user", async (req, res) => {
   const { idTryout, idUser, jenis } = req.body;
   const normalizedJenis = normalizeJenis(jenis);
   const isKedinasan = isKedinasanJenis(normalizedJenis);
+  const requestMeta = {
+    idTryout,
+    idUser,
+    jenis: normalizedJenis || jenis || "",
+    ip: req.ip,
+  };
 
   if (!idTryout || !idUser) {
+    logProcessTryoutUser("warn", "invalid request body", {
+      ...requestMeta,
+      bodyKeys: Object.keys(req.body || {}),
+    });
     return res.status(400).json({
       success: false,
       message: "idTryout dan idUser wajib diisi",
@@ -689,6 +731,7 @@ app.post("/process-tryout-user", async (req, res) => {
 
     if (!latestV2Rows.length) {
       await conn.rollback();
+      logProcessTryoutUser("warn", "latest v2 not found", requestMeta);
       return res.status(404).json({
         success: false,
         message: "Jawaban user untuk tryout ini tidak ditemukan",
@@ -698,6 +741,7 @@ app.post("/process-tryout-user", async (req, res) => {
     // 2) Parse JSON jawaban per-mapel jadi bentuk jawaban detail
     stepStart = Date.now();
     const parsedJawaban = [];
+    const invalidJsonRows = [];
     latestV2Rows.forEach((row) => {
       try {
         const arr = JSON.parse(row.jawaban_user_permapel || "[]");
@@ -714,16 +758,29 @@ app.post("/process-tryout-user", async (req, res) => {
           ]);
         });
       } catch (e) {
-        // skip row JSON invalid
+        invalidJsonRows.push({
+          id_mapel: row.id_mapel,
+          row_id: row.id,
+          message: e.message,
+        });
       }
     });
     mark("parse_jawaban_ms", stepStart);
 
     if (!parsedJawaban.length) {
       await conn.rollback();
+      logProcessTryoutUser("warn", "parsed jawaban empty", {
+        ...requestMeta,
+        latestV2Count: latestV2Rows.length,
+        invalidJsonCount: invalidJsonRows.length,
+        invalidJsonRows,
+      });
       return res.status(400).json({
         success: false,
-        message: "Format jawaban user tidak valid",
+        message:
+          invalidJsonRows.length > 0
+            ? "Format jawaban user tidak valid (JSON jawaban rusak)"
+            : "Format jawaban user tidak valid (jawaban kosong)",
       });
     }
 
@@ -831,6 +888,10 @@ app.post("/process-tryout-user", async (req, res) => {
 
     if (!scoreRows.length) {
       await conn.rollback();
+      logProcessTryoutUser("warn", "score rows empty", {
+        ...requestMeta,
+        parsedJawabanCount: parsedJawaban.length,
+      });
       return res.status(404).json({
         success: false,
         message: "Nilai user tidak dapat dihitung",
@@ -858,6 +919,7 @@ app.post("/process-tryout-user", async (req, res) => {
     );
     if (!userRows.length) {
       await conn.rollback();
+      logProcessTryoutUser("warn", "user not found", requestMeta);
       return res.status(404).json({
         success: false,
         message: "Data user tidak ditemukan",
@@ -921,6 +983,12 @@ app.post("/process-tryout-user", async (req, res) => {
     mark("clear_related_cache_ms", stepStart);
 
     timings.total_process_ms = Date.now() - processStart;
+    logProcessTryoutUser("info", "process success", {
+      ...requestMeta,
+      total: finalTotal,
+      rank: userRank,
+      timings,
+    });
     return res.json({
       success: true,
       message: `Pengumuman user ${idUser} untuk tryout ${idTryout} berhasil diproses`,
@@ -939,7 +1007,11 @@ app.post("/process-tryout-user", async (req, res) => {
     } catch (rollbackErr) {
       console.error("Rollback error:", rollbackErr);
     }
-    console.error(err);
+    logProcessTryoutUser("error", "process failed", {
+      ...requestMeta,
+      error: err.message,
+      stack: err.stack,
+    });
     return res.status(500).json({ success: false, error: err.message });
   } finally {
     conn.release();
