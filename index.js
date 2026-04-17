@@ -3,6 +3,15 @@ import mysql from "mysql2/promise";
 import Redis from "ioredis";
 
 const app = express();
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
 app.use(express.json());
 app.use((err, req, res, next) => {
   if (err && err.type === "entity.parse.failed") {
