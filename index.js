@@ -71,6 +71,14 @@ function logProcessTryoutUser(level = "info", message = "", context = {}) {
   console.log(`[process-tryout-user] ${message}`, payload);
 }
 
+function userNotAttemptedResponse(message = "Kamu belum mengerjakan tryout ini, jadi belum bisa akses pengumuman nilai.") {
+  return {
+    success: false,
+    code: "USER_NOT_ATTEMPTED",
+    message,
+  };
+}
+
 async function deleteRedisKeysByPatterns(patterns = []) {
   const keySet = new Set();
 
@@ -741,11 +749,7 @@ app.post("/process-tryout-user", async (req, res) => {
     if (!latestV2Rows.length) {
       await conn.rollback();
       logProcessTryoutUser("warn", "latest v2 not found", requestMeta);
-      return res.status(400).json({
-        success: false,
-        message:
-          "Kamu belum mengerjakan tryout ini, jadi belum bisa akses pengumuman nilai.",
-      });
+      return res.status(200).json(userNotAttemptedResponse());
     }
 
     // 2) Parse JSON jawaban per-mapel jadi bentuk jawaban detail
@@ -786,11 +790,13 @@ app.post("/process-tryout-user", async (req, res) => {
         invalidJsonRows,
       });
       return res.status(400).json({
-        success: false,
-        message:
-          invalidJsonRows.length > 0
-            ? "Data jawaban tryout tidak valid. Silakan hubungi admin."
-            : "Kamu belum mengerjakan tryout ini, jadi belum bisa akses pengumuman nilai.",
+        ...(invalidJsonRows.length > 0
+          ? {
+              success: false,
+              code: "INVALID_JAWABAN_DATA",
+              message: "Data jawaban tryout tidak valid. Silakan hubungi admin.",
+            }
+          : userNotAttemptedResponse()),
       });
     }
 
@@ -902,11 +908,7 @@ app.post("/process-tryout-user", async (req, res) => {
         ...requestMeta,
         parsedJawabanCount: parsedJawaban.length,
       });
-      return res.status(400).json({
-        success: false,
-        message:
-          "Kamu belum mengerjakan tryout ini, jadi belum bisa akses pengumuman nilai.",
-      });
+      return res.status(200).json(userNotAttemptedResponse());
     }
 
     const rawTotal = Number(scoreRows[0].raw_total || 0);
