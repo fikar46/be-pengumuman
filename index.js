@@ -789,15 +789,14 @@ app.post("/process-tryout-user", async (req, res) => {
         invalidJsonCount: invalidJsonRows.length,
         invalidJsonRows,
       });
-      return res.status(400).json({
-        ...(invalidJsonRows.length > 0
-          ? {
-              success: false,
-              code: "INVALID_JAWABAN_DATA",
-              message: "Data jawaban tryout tidak valid. Silakan hubungi admin.",
-            }
-          : userNotAttemptedResponse()),
-      });
+      if (invalidJsonRows.length > 0) {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_JAWABAN_DATA",
+          message: "Data jawaban tryout tidak valid. Silakan hubungi admin.",
+        });
+      }
+      return res.status(200).json(userNotAttemptedResponse());
     }
 
     // 3) Refresh tabel jawaban detail untuk user ini saja
