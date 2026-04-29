@@ -592,7 +592,7 @@ app.post("/process-tryout", async (req, res) => {
               ) / (
                 CASE
                   WHEN ? = 'tka' THEN 1
-                  WHEN ? = 'umptkin' THEN 1
+                  WHEN ? = 'umptkin' THEN NULLIF(COUNT(DISTINCT jut.id_mapel), 0)
                   ELSE 7
                 END
               ) AS total
