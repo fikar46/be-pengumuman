@@ -592,6 +592,7 @@ app.post("/process-tryout", async (req, res) => {
               ) / (
                 CASE
                   WHEN ? = 'tka' THEN 1
+                  WHEN ? = 'umptkin' THEN 1
                   ELSE 7
                 END
               ) AS total
@@ -606,7 +607,7 @@ app.post("/process-tryout", async (req, res) => {
         ) r
         LEFT JOIN userdata ud ON ud.id_user = r.id_user;
         `,
-        [idTryout, normalizedJenis, normalizedJenis]
+        [idTryout, normalizedJenis, normalizedJenis, normalizedJenis]
       );
     }
     mark("insert_rank_ms", stepStart);
