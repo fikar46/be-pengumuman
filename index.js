@@ -55,6 +55,10 @@ function isKedinasanJenis(jenis = "") {
   return normalized === "kedinasan" || normalized === "cpns" || normalized === "skd";
 }
 
+function isUmUgmJenis(jenis = "") {
+  return normalizeJenis(jenis) === "um ugm";
+}
+
 function logProcessTryoutUser(level = "info", message = "", context = {}) {
   const payload = {
     at: new Date().toISOString(),
@@ -445,6 +449,7 @@ app.post("/process-tryout", async (req, res) => {
   const processStart = Date.now();
   const normalizedJenis = normalizeJenis(jenis);
   const isKedinasan = isKedinasanJenis(normalizedJenis);
+  const isUmUgm = isUmUgmJenis(normalizedJenis);
   const timings = {};
   const mark = (name, startAt) => {
     timings[name] = Date.now() - startAt;
@@ -550,6 +555,64 @@ app.post("/process-tryout", async (req, res) => {
         LEFT JOIN userdata ud ON ud.id_user = r.id_user;
         `,
         [idTryout, idTryout]
+      );
+    } else if (isUmUgm) {
+      await conn.query(
+        `
+        INSERT INTO rank_tryout_2025
+        (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year)
+        SELECT
+          r.id_user,
+          r.username,
+          r.peminatan,
+          r.total,
+          ud.instansi,
+          ud.provinsi,
+          r.rnk,
+          ?,
+          2026
+        FROM (
+          SELECT
+            n.id_user,
+            n.username,
+            n.peminatan,
+            n.total,
+            ROW_NUMBER() OVER (ORDER BY n.total DESC) AS rnk
+          FROM (
+            SELECT
+              jut.id_user,
+              u.username,
+              COALESCE(MAX(NULLIF(jut.peminatan, '')), 'Saintek') AS peminatan,
+              (
+                SUM(
+                  CASE
+                    WHEN (jut.id_mapel = 51 OR UPPER(TRIM(mp.nama)) = 'TPA') THEN
+                      CASE
+                        WHEN jut.status = 'benar' THEN 1
+                        ELSE 0
+                      END
+                    ELSE
+                      CASE
+                        WHEN jut.status = 'benar' THEN 4
+                        WHEN jut.status = 'salah' THEN -1
+                        ELSE 0
+                      END
+                  END
+                ) / 360
+              ) * 1000 AS total
+            FROM tmp_latest_jawaban jut
+            JOIN soal_tryout st
+              ON st.no_soal = jut.no_soal
+             AND st.id_mapel = jut.id_mapel
+             AND st.id_tryout = jut.id_tryout
+            JOIN mata_pelajaran mp ON mp.id = jut.id_mapel
+            JOIN users u ON u.id = jut.id_user
+            GROUP BY jut.id_user, u.username
+          ) n
+        ) r
+        LEFT JOIN userdata ud ON ud.id_user = r.id_user;
+        `,
+        [idTryout]
       );
     } else {
       await conn.query(
@@ -700,6 +763,7 @@ app.post("/process-tryout-user", async (req, res) => {
   const { idTryout, idUser, jenis } = req.body;
   const normalizedJenis = normalizeJenis(jenis);
   const isKedinasan = isKedinasanJenis(normalizedJenis);
+  const isUmUgm = isUmUgmJenis(normalizedJenis);
   const requestMeta = {
     idTryout,
     idUser,
@@ -881,6 +945,20 @@ app.post("/process-tryout-user", async (req, res) => {
             ju.id_user,
             COALESCE(SUM(
               CASE
+                WHEN ? = 'um ugm' THEN
+                  CASE
+                    WHEN (ju.id_mapel = 51 OR UPPER(TRIM(mp.nama)) = 'TPA') THEN
+                      CASE
+                        WHEN ju.status = 'benar' THEN 1
+                        ELSE 0
+                      END
+                    ELSE
+                      CASE
+                        WHEN ju.status = 'benar' THEN 4
+                        WHEN ju.status = 'salah' THEN -1
+                        ELSE 0
+                      END
+                  END
                 WHEN ju.status = 'benar' THEN
                   CASE
                     WHEN ? = 'tka' THEN 5
@@ -895,10 +973,11 @@ app.post("/process-tryout-user", async (req, res) => {
             ON st.no_soal = ju.no_soal
            AND st.id_mapel = ju.id_mapel
            AND st.id_tryout = ju.id_tryout
+          JOIN mata_pelajaran mp ON mp.id = ju.id_mapel
           WHERE ju.id_tryout = ? AND ju.id_user = ?
           GROUP BY ju.id_user
           `,
-          [normalizedJenis, idTryout, idUser]
+          [normalizedJenis, normalizedJenis, idTryout, idUser]
         );
     mark("calculate_score_ms", stepStart);
 
@@ -913,10 +992,11 @@ app.post("/process-tryout-user", async (req, res) => {
 
     const rawTotal = Number(scoreRows[0].raw_total || 0);
     const userPeminatan = scoreRows[0].peminatan || (isKedinasan ? "ipc" : "Saintek");
-    const finalTotal =
-      normalizedJenis === "tka" || isKedinasan
+    const finalTotal = isUmUgm
+      ? (rawTotal / 360) * 1000
+      : (normalizedJenis === "tka" || isKedinasan
         ? rawTotal
-        : rawTotal / 7;
+        : rawTotal / 7);
 
     // 7) Upsert ranking user ke rank_tryout_2025
     stepStart = Date.now();
