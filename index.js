@@ -760,10 +760,11 @@ app.post("/process-tryout", async (req, res) => {
 
 // 🚀 API untuk proses pengumuman per-user (versi ringan untuk halaman user)
 app.post("/process-tryout-user", async (req, res) => {
-  const { idTryout, idUser, jenis } = req.body;
+  const { idTryout, idUser, jenis, peminatan } = req.body;
   const normalizedJenis = normalizeJenis(jenis);
   const isKedinasan = isKedinasanJenis(normalizedJenis);
   const isUmUgm = isUmUgmJenis(normalizedJenis);
+  const preferredPeminatan = (peminatan || "").toString().trim();
   const requestMeta = {
     idTryout,
     idUser,
@@ -981,9 +982,14 @@ app.post("/process-tryout-user", async (req, res) => {
            AND st.id_tryout = ju.id_tryout
           JOIN mata_pelajaran mp ON mp.id = ju.id_mapel
           WHERE ju.id_tryout = ? AND ju.id_user = ?
+            AND (
+              ? <> 'um ugm'
+              OR ? = ''
+              OR LOWER(COALESCE(ju.peminatan, '')) = LOWER(?)
+            )
           GROUP BY ju.id_user
           `,
-          [normalizedJenis, normalizedJenis, idTryout, idUser, idTryout, idUser]
+          [normalizedJenis, normalizedJenis, idTryout, idUser, idTryout, idUser, normalizedJenis, preferredPeminatan, preferredPeminatan]
         );
     mark("calculate_score_ms", stepStart);
 
