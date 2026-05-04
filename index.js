@@ -588,14 +588,14 @@ app.post("/process-tryout", async (req, res) => {
                   CASE
                     WHEN (jut.id_mapel = 51 OR UPPER(TRIM(mp.nama)) = 'TPA') THEN
                       CASE
-                        WHEN jut.status = 'benar' THEN 1
+                        WHEN jut.jawaban = st.kunci THEN 1
                         ELSE 0
                       END
                     ELSE
                       CASE
-                        WHEN jut.status = 'benar' THEN 4
-                        WHEN jut.status = 'salah' THEN -1
-                        ELSE 0
+                        WHEN jut.jawaban = st.kunci THEN 4
+                        WHEN COALESCE(jut.jawaban, '') = '' THEN 0
+                        ELSE -1
                       END
                   END
                 ) / 360
@@ -949,14 +949,14 @@ app.post("/process-tryout-user", async (req, res) => {
                   CASE
                     WHEN (ju.id_mapel = 51 OR UPPER(TRIM(mp.nama)) = 'TPA') THEN
                       CASE
-                        WHEN ju.status = 'benar' THEN 1
+                        WHEN ju.jawaban = st.kunci THEN 1
                         ELSE 0
                       END
                     ELSE
                       CASE
-                        WHEN ju.status = 'benar' THEN 4
-                        WHEN ju.status = 'salah' THEN -1
-                        ELSE 0
+                        WHEN ju.jawaban = st.kunci THEN 4
+                        WHEN COALESCE(ju.jawaban, '') = '' THEN 0
+                        ELSE -1
                       END
                   END
                 WHEN ju.status = 'benar' THEN
@@ -969,6 +969,12 @@ app.post("/process-tryout-user", async (req, res) => {
             ), 0) AS raw_total,
             COALESCE(MAX(NULLIF(ju.peminatan, '')), 'Saintek') AS peminatan
           FROM jawaban_user_tryout ju
+          JOIN (
+            SELECT MAX(id) AS max_id
+            FROM jawaban_user_tryout
+            WHERE id_tryout = ? AND id_user = ?
+            GROUP BY id_user, id_tryout, id_mapel, no_soal
+          ) x ON x.max_id = ju.id
           JOIN soal_tryout st
             ON st.no_soal = ju.no_soal
            AND st.id_mapel = ju.id_mapel
@@ -977,7 +983,7 @@ app.post("/process-tryout-user", async (req, res) => {
           WHERE ju.id_tryout = ? AND ju.id_user = ?
           GROUP BY ju.id_user
           `,
-          [normalizedJenis, normalizedJenis, idTryout, idUser]
+          [normalizedJenis, normalizedJenis, idTryout, idUser, idTryout, idUser]
         );
     mark("calculate_score_ms", stepStart);
 
