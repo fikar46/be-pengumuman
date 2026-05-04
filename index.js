@@ -583,7 +583,7 @@ app.post("/process-tryout", async (req, res) => {
               jut.id_user,
               u.username,
               COALESCE(MAX(NULLIF(jut.peminatan, '')), 'Saintek') AS peminatan,
-              LEAST(1000, (
+              (
                 SUM(
                   CASE
                     WHEN (jut.id_mapel = 51 OR UPPER(TRIM(mp.nama)) = 'TPA') THEN
@@ -599,7 +599,7 @@ app.post("/process-tryout", async (req, res) => {
                       END
                   END
                 ) / 360
-              ) * 1000) AS total
+              ) * 1000 AS total
             FROM tmp_latest_jawaban jut
             JOIN soal_tryout st
               ON st.no_soal = jut.no_soal
@@ -993,7 +993,7 @@ app.post("/process-tryout-user", async (req, res) => {
     const rawTotal = Number(scoreRows[0].raw_total || 0);
     const userPeminatan = scoreRows[0].peminatan || (isKedinasan ? "ipc" : "Saintek");
     const finalTotal = isUmUgm
-      ? Math.min(1000, (rawTotal / 360) * 1000)
+      ? (rawTotal / 360) * 1000
       : (normalizedJenis === "tka" || isKedinasan
         ? rawTotal
         : rawTotal / 7);
