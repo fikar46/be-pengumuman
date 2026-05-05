@@ -662,7 +662,16 @@ app.post("/process-tryout", async (req, res) => {
                 ELSE -1
               END
             ) AS raw_total
-          FROM tmp_latest_jawaban jut
+          FROM (
+            SELECT j1.*
+            FROM jawaban_user_tryout_pembahasan j1
+            JOIN (
+              SELECT MAX(id) AS max_id
+              FROM jawaban_user_tryout_pembahasan
+              WHERE id_tryout = ? AND LOWER(COALESCE(peminatan, '')) = 'ipc'
+              GROUP BY id_user, id_tryout, id_mapel, no_soal
+            ) lj ON lj.max_id = j1.id
+          ) jut
           JOIN soal_tryout st
             ON st.no_soal = jut.no_soal
            AND st.id_mapel = jut.id_mapel
@@ -673,7 +682,7 @@ app.post("/process-tryout", async (req, res) => {
         ) r
         LEFT JOIN userdata ud ON ud.id_user = r.id_user;
         `,
-        [idTryout]
+        [idTryout, idTryout]
       );
     } else {
       await conn.query(
@@ -1036,13 +1045,16 @@ app.post("/process-tryout-user", async (req, res) => {
               END
             ), 0) AS raw_total,
             COALESCE(MAX(NULLIF(ju.peminatan, '')), 'Saintek') AS peminatan
-          FROM jawaban_user_tryout ju
-          JOIN (
-            SELECT MAX(id) AS max_id
-            FROM jawaban_user_tryout
-            WHERE id_tryout = ? AND id_user = ?
-            GROUP BY id_user, id_tryout, id_mapel, no_soal
-          ) x ON x.max_id = ju.id
+          FROM (
+            SELECT j1.*
+            FROM jawaban_user_tryout_pembahasan j1
+            JOIN (
+              SELECT MAX(id) AS max_id
+              FROM jawaban_user_tryout_pembahasan
+              WHERE id_tryout = ? AND id_user = ?
+              GROUP BY id_user, id_tryout, id_mapel, no_soal
+            ) lx ON lx.max_id = j1.id
+          ) ju
           JOIN soal_tryout st
             ON st.no_soal = ju.no_soal
            AND st.id_mapel = ju.id_mapel
