@@ -59,6 +59,10 @@ function isUmUgmJenis(jenis = "") {
   return normalizeJenis(jenis) === "um ugm";
 }
 
+function isSimakUiJenis(jenis = "") {
+  return normalizeJenis(jenis) === "simak ui";
+}
+
 function logProcessTryoutUser(level = "info", message = "", context = {}) {
   const payload = {
     at: new Date().toISOString(),
@@ -450,6 +454,7 @@ app.post("/process-tryout", async (req, res) => {
   const normalizedJenis = normalizeJenis(jenis);
   const isKedinasan = isKedinasanJenis(normalizedJenis);
   const isUmUgm = isUmUgmJenis(normalizedJenis);
+  const isSimakUi = isSimakUiJenis(normalizedJenis);
   const timings = {};
   const mark = (name, startAt) => {
     timings[name] = Date.now() - startAt;
@@ -481,6 +486,12 @@ app.post("/process-tryout", async (req, res) => {
         ...weightSummary,
         skipped: true,
         reason: "not_required_for_kedinasan",
+      };
+    } else if (isSimakUi) {
+      weightSummary = {
+        ...weightSummary,
+        skipped: true,
+        reason: "not_required_for_simak_ui",
       };
     } else if (!weightGuard.skip) {
       const autoWeightResult = await autoSetBobotSoalByTryout(conn, idTryout);
@@ -582,7 +593,7 @@ app.post("/process-tryout", async (req, res) => {
             SELECT
               jut.id_user,
               u.username,
-              COALESCE(MAX(NULLIF(jut.peminatan, '')), 'Saintek') AS peminatan,
+              COALESCE(MAX(NULLIF(up.peminatan_user, '')), 'Saintek') AS peminatan,
               (
                 SUM(
                   CASE
@@ -601,11 +612,77 @@ app.post("/process-tryout", async (req, res) => {
                 ) / 360
               ) * 1000 AS total
             FROM tmp_latest_jawaban jut
+            JOIN (
+              SELECT
+                id_user,
+                COALESCE(MAX(NULLIF(peminatan, '')), 'Saintek') AS peminatan_user
+              FROM tmp_latest_jawaban
+              WHERE id_tryout = ?
+              GROUP BY id_user
+            ) up
+              ON up.id_user = jut.id_user
+             AND LOWER(COALESCE(jut.peminatan, '')) = LOWER(up.peminatan_user)
             JOIN soal_tryout st
               ON st.no_soal = jut.no_soal
              AND st.id_mapel = jut.id_mapel
              AND st.id_tryout = jut.id_tryout
             JOIN mata_pelajaran mp ON mp.id = jut.id_mapel
+            JOIN users u ON u.id = jut.id_user
+            GROUP BY jut.id_user, u.username
+          ) n
+        ) r
+        LEFT JOIN userdata ud ON ud.id_user = r.id_user;
+        `,
+        [idTryout, idTryout]
+      );
+    } else if (isSimakUi) {
+      await conn.query(
+        `
+        INSERT INTO rank_tryout_2025
+        (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year)
+        SELECT
+          r.id_user,
+          r.username,
+          r.peminatan,
+          CASE
+            WHEN r.max_raw > r.min_raw THEN ((r.raw_total - r.min_raw) / (r.max_raw - r.min_raw)) * 1000
+            ELSE 500
+          END AS total,
+          ud.instansi,
+          ud.provinsi,
+          ROW_NUMBER() OVER (
+            ORDER BY
+              CASE
+                WHEN r.max_raw > r.min_raw THEN ((r.raw_total - r.min_raw) / (r.max_raw - r.min_raw)) * 1000
+                ELSE 500
+              END DESC
+          ) AS rnk,
+          ?,
+          2026
+        FROM (
+          SELECT
+            n.id_user,
+            n.username,
+            n.peminatan,
+            n.raw_total,
+            MIN(n.raw_total) OVER () AS min_raw,
+            MAX(n.raw_total) OVER () AS max_raw
+          FROM (
+            SELECT
+              jut.id_user,
+              u.username,
+              COALESCE(MAX(NULLIF(jut.peminatan, '')), 'ipc') AS peminatan,
+              SUM(
+                CASE
+                  WHEN jut.status = 'benar' THEN COALESCE(st.point, 0) * 100
+                  ELSE 0
+                END
+              ) AS raw_total
+            FROM tmp_latest_jawaban jut
+            JOIN soal_tryout st
+              ON st.no_soal = jut.no_soal
+             AND st.id_mapel = jut.id_mapel
+             AND st.id_tryout = jut.id_tryout
             JOIN users u ON u.id = jut.id_user
             GROUP BY jut.id_user, u.username
           ) n
@@ -760,11 +837,10 @@ app.post("/process-tryout", async (req, res) => {
 
 // 🚀 API untuk proses pengumuman per-user (versi ringan untuk halaman user)
 app.post("/process-tryout-user", async (req, res) => {
-  const { idTryout, idUser, jenis, peminatan } = req.body;
+  const { idTryout, idUser, jenis } = req.body;
   const normalizedJenis = normalizeJenis(jenis);
   const isKedinasan = isKedinasanJenis(normalizedJenis);
   const isUmUgm = isUmUgmJenis(normalizedJenis);
-  const preferredPeminatan = (peminatan || "").toString().trim();
   const requestMeta = {
     idTryout,
     idUser,
@@ -982,14 +1058,9 @@ app.post("/process-tryout-user", async (req, res) => {
            AND st.id_tryout = ju.id_tryout
           JOIN mata_pelajaran mp ON mp.id = ju.id_mapel
           WHERE ju.id_tryout = ? AND ju.id_user = ?
-            AND (
-              ? <> 'um ugm'
-              OR ? = ''
-              OR LOWER(COALESCE(ju.peminatan, '')) = LOWER(?)
-            )
           GROUP BY ju.id_user
           `,
-          [normalizedJenis, normalizedJenis, idTryout, idUser, idTryout, idUser, normalizedJenis, preferredPeminatan, preferredPeminatan]
+          [normalizedJenis, normalizedJenis, idTryout, idUser, idTryout, idUser]
         );
     mark("calculate_score_ms", stepStart);
 
