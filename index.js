@@ -674,17 +674,9 @@ app.post("/process-tryout", async (req, res) => {
               'ipc' AS peminatan,
               SUM(
                 CASE
-                  WHEN (jut.id_mapel = 51 OR UPPER(TRIM(mp.nama)) = 'TPA') THEN
-                    CASE
-                      WHEN jut.jawaban = st.kunci THEN 1
-                      ELSE 0
-                    END
-                  ELSE
-                    CASE
-                      WHEN jut.jawaban = st.kunci THEN 4
-                      WHEN COALESCE(jut.jawaban, '') = '' THEN 0
-                      ELSE -1
-                    END
+                  WHEN jut.jawaban = st.kunci THEN 4
+                  WHEN COALESCE(jut.jawaban, '') = '' THEN 0
+                  ELSE -1
                 END
               ) AS raw_total
             FROM tmp_latest_jawaban jut
@@ -1049,17 +1041,9 @@ app.post("/process-tryout-user", async (req, res) => {
                   END
                 WHEN ? = 'simak ui' THEN
                   CASE
-                    WHEN (ju.id_mapel = 51 OR UPPER(TRIM(mp.nama)) = 'TPA') THEN
-                      CASE
-                        WHEN ju.jawaban = st.kunci THEN 1
-                        ELSE 0
-                      END
-                    ELSE
-                      CASE
-                        WHEN ju.jawaban = st.kunci THEN 4
-                        WHEN COALESCE(ju.jawaban, '') = '' THEN 0
-                        ELSE -1
-                      END
+                    WHEN ju.jawaban = st.kunci THEN 4
+                    WHEN COALESCE(ju.jawaban, '') = '' THEN 0
+                    ELSE -1
                   END
                 WHEN ju.status = 'benar' THEN
                   CASE
@@ -1100,11 +1084,50 @@ app.post("/process-tryout-user", async (req, res) => {
 
     const rawTotal = Number(scoreRows[0].raw_total || 0);
     const userPeminatan = scoreRows[0].peminatan || ((isKedinasan || isSimakUi) ? "ipc" : "Saintek");
-    const finalTotal = (isUmUgm || isSimakUi)
+    let finalTotal = (isUmUgm || isSimakUi)
       ? (rawTotal / 360) * 1000
       : (normalizedJenis === "tka" || isKedinasan
         ? rawTotal
         : rawTotal / 7);
+    if (isSimakUi) {
+      const [simakRangeRows] = await conn.query(
+        `
+        SELECT
+          MIN(x.raw_total) AS min_raw,
+          MAX(x.raw_total) AS max_raw
+        FROM (
+          SELECT
+            ju2.id_user,
+            SUM(
+              CASE
+                WHEN ju2.jawaban = st2.kunci THEN 4
+                WHEN COALESCE(ju2.jawaban, '') = '' THEN 0
+                ELSE -1
+              END
+            ) AS raw_total
+          FROM jawaban_user_tryout ju2
+          JOIN (
+            SELECT MAX(id) AS max_id
+            FROM jawaban_user_tryout
+            WHERE id_tryout = ?
+            GROUP BY id_user, id_tryout, id_mapel, no_soal
+          ) lx ON lx.max_id = ju2.id
+          JOIN soal_tryout st2
+            ON st2.no_soal = ju2.no_soal
+           AND st2.id_mapel = ju2.id_mapel
+           AND st2.id_tryout = ju2.id_tryout
+          WHERE ju2.id_tryout = ?
+          GROUP BY ju2.id_user
+        ) x
+        `,
+        [idTryout, idTryout]
+      );
+      const minRaw = Number(simakRangeRows?.[0]?.min_raw ?? 0);
+      const maxRaw = Number(simakRangeRows?.[0]?.max_raw ?? 0);
+      finalTotal = maxRaw > minRaw
+        ? ((rawTotal - minRaw) / (maxRaw - minRaw)) * 1000
+        : 500;
+    }
 
     // 7) Upsert ranking user ke rank_tryout_2025
     stepStart = Date.now();
