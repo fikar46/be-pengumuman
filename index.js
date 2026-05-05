@@ -644,50 +644,31 @@ app.post("/process-tryout", async (req, res) => {
           r.id_user,
           r.username,
           r.peminatan,
-          CASE
-            WHEN r.max_raw > r.min_raw THEN ((r.raw_total - r.min_raw) / (r.max_raw - r.min_raw)) * 1000
-            ELSE 500
-          END AS total,
+          GREATEST(0, LEAST(1000, (r.raw_total / 360) * 1000)) AS total,
           ud.instansi,
           ud.provinsi,
-          ROW_NUMBER() OVER (
-            ORDER BY
-              CASE
-                WHEN r.max_raw > r.min_raw THEN ((r.raw_total - r.min_raw) / (r.max_raw - r.min_raw)) * 1000
-                ELSE 500
-              END DESC
-          ) AS rnk,
+          ROW_NUMBER() OVER (ORDER BY GREATEST(0, LEAST(1000, (r.raw_total / 360) * 1000)) DESC) AS rnk,
           ?,
           2026
         FROM (
           SELECT
-            n.id_user,
-            n.username,
-            n.peminatan,
-            n.raw_total,
-            MIN(n.raw_total) OVER () AS min_raw,
-            MAX(n.raw_total) OVER () AS max_raw
-          FROM (
-            SELECT
-              jut.id_user,
-              u.username,
-              'ipc' AS peminatan,
-              SUM(
-                CASE
-                  WHEN jut.jawaban = st.kunci THEN 4
-                  WHEN COALESCE(jut.jawaban, '') = '' THEN 0
-                  ELSE -1
-                END
-              ) AS raw_total
-            FROM tmp_latest_jawaban jut
-            JOIN soal_tryout st
-              ON st.no_soal = jut.no_soal
-             AND st.id_mapel = jut.id_mapel
-             AND st.id_tryout = jut.id_tryout
-            JOIN mata_pelajaran mp ON mp.id = jut.id_mapel
-            JOIN users u ON u.id = jut.id_user
-            GROUP BY jut.id_user, u.username
-          ) n
+            jut.id_user,
+            u.username,
+            'ipc' AS peminatan,
+            SUM(
+              CASE
+                WHEN jut.jawaban = st.kunci THEN 4
+                WHEN COALESCE(jut.jawaban, '') = '' THEN 0
+                ELSE -1
+              END
+            ) AS raw_total
+          FROM tmp_latest_jawaban jut
+          JOIN soal_tryout st
+            ON st.no_soal = jut.no_soal
+           AND st.id_mapel = jut.id_mapel
+           AND st.id_tryout = jut.id_tryout
+          JOIN users u ON u.id = jut.id_user
+          GROUP BY jut.id_user, u.username
         ) r
         LEFT JOIN userdata ud ON ud.id_user = r.id_user;
         `,
@@ -1090,43 +1071,7 @@ app.post("/process-tryout-user", async (req, res) => {
         ? rawTotal
         : rawTotal / 7);
     if (isSimakUi) {
-      const [simakRangeRows] = await conn.query(
-        `
-        SELECT
-          MIN(x.raw_total) AS min_raw,
-          MAX(x.raw_total) AS max_raw
-        FROM (
-          SELECT
-            ju2.id_user,
-            SUM(
-              CASE
-                WHEN ju2.jawaban = st2.kunci THEN 4
-                WHEN COALESCE(ju2.jawaban, '') = '' THEN 0
-                ELSE -1
-              END
-            ) AS raw_total
-          FROM jawaban_user_tryout ju2
-          JOIN (
-            SELECT MAX(id) AS max_id
-            FROM jawaban_user_tryout
-            WHERE id_tryout = ?
-            GROUP BY id_user, id_tryout, id_mapel, no_soal
-          ) lx ON lx.max_id = ju2.id
-          JOIN soal_tryout st2
-            ON st2.no_soal = ju2.no_soal
-           AND st2.id_mapel = ju2.id_mapel
-           AND st2.id_tryout = ju2.id_tryout
-          WHERE ju2.id_tryout = ?
-          GROUP BY ju2.id_user
-        ) x
-        `,
-        [idTryout, idTryout]
-      );
-      const minRaw = Number(simakRangeRows?.[0]?.min_raw ?? 0);
-      const maxRaw = Number(simakRangeRows?.[0]?.max_raw ?? 0);
-      finalTotal = maxRaw > minRaw
-        ? ((rawTotal - minRaw) / (maxRaw - minRaw)) * 1000
-        : 500;
+      finalTotal = Math.max(0, Math.min(1000, finalTotal));
     }
 
     // 7) Upsert ranking user ke rank_tryout_2025
