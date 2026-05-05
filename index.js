@@ -652,37 +652,24 @@ app.post("/process-tryout", async (req, res) => {
           2026
         FROM (
           SELECT
-            jut.id_user,
+            v.id_user,
             u.username,
             'ipc' AS peminatan,
-            SUM(
-              CASE
-                WHEN jut.jawaban = st.kunci THEN 4
-                WHEN COALESCE(jut.jawaban, '') = '' THEN 0
-                ELSE -1
-              END
-            ) AS raw_total
-          FROM (
-            SELECT j1.*
-            FROM jawaban_user_tryout_pembahasan j1
-            JOIN (
-              SELECT MAX(id) AS max_id
-              FROM jawaban_user_tryout_pembahasan
-              WHERE id_tryout = ? AND LOWER(COALESCE(peminatan, '')) = 'ipc'
-              GROUP BY id_user, id_tryout, id_mapel, no_soal
-            ) lj ON lj.max_id = j1.id
-          ) jut
-          JOIN soal_tryout st
-            ON st.no_soal = jut.no_soal
-           AND st.id_mapel = jut.id_mapel
-           AND st.id_tryout = jut.id_tryout
-          JOIN users u ON u.id = jut.id_user
-          WHERE LOWER(COALESCE(jut.peminatan, '')) = 'ipc'
-          GROUP BY jut.id_user, u.username
+            SUM((COALESCE(v.benar, 0) * 4) - COALESCE(v.salah, 0)) AS raw_total
+          FROM jawaban_user_tryout_v2 v
+          JOIN (
+            SELECT MAX(id) AS max_id
+            FROM jawaban_user_tryout_v2
+            WHERE id_tryout = ?
+            GROUP BY id_user, id_tryout, id_mapel
+          ) lv ON lv.max_id = v.id
+          JOIN users u ON u.id = v.id_user
+          WHERE v.id_tryout = ?
+          GROUP BY v.id_user, u.username
         ) r
         LEFT JOIN userdata ud ON ud.id_user = r.id_user;
         `,
-        [idTryout, idTryout]
+        [idTryout, idTryout, idTryout]
       );
     } else {
       await conn.query(
@@ -1009,6 +996,25 @@ app.post("/process-tryout-user", async (req, res) => {
           GROUP BY v.id_user
           `,
           [idTryout, idUser]
+        )
+      : isSimakUi
+      ? await conn.query(
+          `
+          SELECT
+            v.id_user,
+            COALESCE(SUM((COALESCE(v.benar, 0) * 4) - COALESCE(v.salah, 0)), 0) AS raw_total,
+            'ipc' AS peminatan
+          FROM jawaban_user_tryout_v2 v
+          JOIN (
+            SELECT MAX(id) AS max_id
+            FROM jawaban_user_tryout_v2
+            WHERE id_tryout = ? AND id_user = ?
+            GROUP BY id_user, id_tryout, id_mapel
+          ) x ON x.max_id = v.id
+          WHERE v.id_tryout = ? AND v.id_user = ?
+          GROUP BY v.id_user
+          `,
+          [idTryout, idUser, idTryout, idUser]
         )
       : await conn.query(
           `
