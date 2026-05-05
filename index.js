@@ -668,6 +668,7 @@ app.post("/process-tryout", async (req, res) => {
            AND st.id_mapel = jut.id_mapel
            AND st.id_tryout = jut.id_tryout
           JOIN users u ON u.id = jut.id_user
+          WHERE LOWER(COALESCE(jut.peminatan, '')) = 'ipc'
           GROUP BY jut.id_user, u.username
         ) r
         LEFT JOIN userdata ud ON ud.id_user = r.id_user;
@@ -1048,9 +1049,13 @@ app.post("/process-tryout-user", async (req, res) => {
            AND st.id_tryout = ju.id_tryout
           JOIN mata_pelajaran mp ON mp.id = ju.id_mapel
           WHERE ju.id_tryout = ? AND ju.id_user = ?
+            AND (
+              ? <> 'simak ui'
+              OR LOWER(COALESCE(ju.peminatan, '')) = 'ipc'
+            )
           GROUP BY ju.id_user
           `,
-          [normalizedJenis, normalizedJenis, normalizedJenis, idTryout, idUser, idTryout, idUser]
+          [normalizedJenis, normalizedJenis, normalizedJenis, idTryout, idUser, idTryout, idUser, normalizedJenis]
         );
     mark("calculate_score_ms", stepStart);
 
