@@ -568,6 +568,14 @@ app.post("/process-tryout", async (req, res) => {
         [idTryout, idTryout]
       );
     } else if (isUmUgm) {
+      await conn.query(`DROP TEMPORARY TABLE IF EXISTS tmp_latest_jawaban_umugm_source`);
+      await conn.query(
+        `
+        CREATE TEMPORARY TABLE tmp_latest_jawaban_umugm_source AS
+        SELECT *
+        FROM tmp_latest_jawaban
+        `
+      );
       await conn.query(
         `
         INSERT INTO rank_tryout_2025
@@ -616,7 +624,7 @@ app.post("/process-tryout", async (req, res) => {
               SELECT
                 id_user,
                 COALESCE(MAX(NULLIF(peminatan, '')), 'Saintek') AS peminatan_user
-              FROM tmp_latest_jawaban
+              FROM tmp_latest_jawaban_umugm_source
               WHERE id_tryout = ?
               GROUP BY id_user
             ) up
