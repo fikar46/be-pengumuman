@@ -652,10 +652,10 @@ app.post("/process-tryout", async (req, res) => {
           r.id_user,
           r.username,
           r.peminatan,
-          GREATEST(0, LEAST(1000, (r.raw_total / 360) * 1000)) AS total,
+          GREATEST(0, LEAST(1000, (r.raw_total / 420) * 1000)) AS total,
           ud.instansi,
           ud.provinsi,
-          ROW_NUMBER() OVER (ORDER BY GREATEST(0, LEAST(1000, (r.raw_total / 360) * 1000)) DESC) AS rnk,
+          ROW_NUMBER() OVER (ORDER BY GREATEST(0, LEAST(1000, (r.raw_total / 420) * 1000)) DESC) AS rnk,
           ?,
           2026
         FROM (
@@ -1097,7 +1097,7 @@ app.post("/process-tryout-user", async (req, res) => {
     const rawTotal = Number(scoreRows[0].raw_total || 0);
     const userPeminatan = scoreRows[0].peminatan || ((isKedinasan || isSimakUi) ? "ipc" : "Saintek");
     let finalTotal = (isUmUgm || isSimakUi)
-      ? (rawTotal / 360) * 1000
+      ? (rawTotal / (isSimakUi ? 420 : 360)) * 1000
       : (normalizedJenis === "tka" || isKedinasan
         ? rawTotal
         : rawTotal / 7);
