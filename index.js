@@ -63,6 +63,35 @@ function isSimakUiJenis(jenis = "") {
   return normalizeJenis(jenis) === "simak ui";
 }
 
+function isUmUnsJenis(jenis = "") {
+  return normalizeJenis(jenis) === "um uns";
+}
+
+async function resolveJenisTryout(conn, idTryout, providedJenis = "") {
+  const normalizedProvided = normalizeJenis(providedJenis);
+  if (normalizedProvided) {
+    return normalizedProvided;
+  }
+
+  if (!conn || !idTryout) {
+    return "";
+  }
+
+  try {
+    const [rows] = await conn.query(
+      `SELECT tipe_tryout FROM tryout WHERE id = ? LIMIT 1`,
+      [idTryout]
+    );
+    return normalizeJenis(rows?.[0]?.tipe_tryout || "");
+  } catch (error) {
+    console.warn("[resolveJenisTryout] failed to resolve tipe_tryout", {
+      idTryout,
+      message: error.message,
+    });
+    return "";
+  }
+}
+
 function logProcessTryoutUser(level = "info", message = "", context = {}) {
   const payload = {
     at: new Date().toISOString(),
@@ -448,13 +477,14 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
 
 // 🚀 API untuk generate ranking & simpan ke rank_tryout_2025
 app.post("/process-tryout", async (req, res) => {
-  const { idTryout,jenis } = req.body;
+  const { idTryout, jenis, tipe_tryout } = req.body;
   const conn = await pool.getConnection();
   const processStart = Date.now();
-  const normalizedJenis = normalizeJenis(jenis);
+  const normalizedJenis = await resolveJenisTryout(conn, idTryout, jenis || tipe_tryout);
   const isKedinasan = isKedinasanJenis(normalizedJenis);
   const isUmUgm = isUmUgmJenis(normalizedJenis);
   const isSimakUi = isSimakUiJenis(normalizedJenis);
+  const isUmUns = isUmUnsJenis(normalizedJenis);
   const timings = {};
   const mark = (name, startAt) => {
     timings[name] = Date.now() - startAt;
@@ -679,6 +709,63 @@ app.post("/process-tryout", async (req, res) => {
         `,
         [idTryout, idTryout, idTryout]
       );
+    } else if (isUmUns) {
+      await conn.query(
+        `
+        INSERT INTO rank_tryout_2025
+        (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year)
+        SELECT
+          r.id_user,
+          r.username,
+          r.peminatan,
+          r.total,
+          ud.instansi,
+          ud.provinsi,
+          r.rnk,
+          ?,
+          2026
+        FROM (
+          SELECT
+            n.id_user,
+            n.username,
+            n.peminatan,
+            n.total,
+            ROW_NUMBER() OVER (ORDER BY n.total DESC) AS rnk
+          FROM (
+            SELECT
+              jut.id_user,
+              u.username,
+              COALESCE(MAX(NULLIF(jut.peminatan, '')), 'ipc') AS peminatan,
+              SUM(
+                CASE
+                  WHEN jut.id_mapel = 51 THEN
+                    CASE
+                      WHEN jut.jawaban = st.kunci THEN 4
+                      WHEN COALESCE(jut.jawaban, '') = '' THEN 0
+                      ELSE -1
+                    END
+                  WHEN jut.id_mapel IN (53, 54, 55) THEN
+                    CASE
+                      WHEN jut.jawaban = st.kunci THEN st.point * 100
+                      ELSE 0
+                    END
+                  ELSE 0
+                END
+              ) AS total
+            FROM tmp_latest_jawaban jut
+            JOIN soal_tryout st
+              ON st.no_soal = jut.no_soal
+             AND st.id_mapel = jut.id_mapel
+             AND st.id_tryout = jut.id_tryout
+            JOIN users u ON u.id = jut.id_user
+            WHERE jut.id_mapel IN (51, 53, 54, 55)
+            GROUP BY jut.id_user, u.username
+          ) n
+        ) r
+        LEFT JOIN userdata ud ON ud.id_user = r.id_user;
+        `,
+        [idTryout]
+      );
     } else {
       await conn.query(
         `
@@ -825,15 +912,11 @@ app.post("/process-tryout", async (req, res) => {
 
 // 🚀 API untuk proses pengumuman per-user (versi ringan untuk halaman user)
 app.post("/process-tryout-user", async (req, res) => {
-  const { idTryout, idUser, jenis } = req.body;
-  const normalizedJenis = normalizeJenis(jenis);
-  const isKedinasan = isKedinasanJenis(normalizedJenis);
-  const isUmUgm = isUmUgmJenis(normalizedJenis);
-  const isSimakUi = isSimakUiJenis(normalizedJenis);
+  const { idTryout, idUser, jenis, tipe_tryout } = req.body;
   const requestMeta = {
     idTryout,
     idUser,
-    jenis: normalizedJenis || jenis || "",
+    jenis: normalizeJenis(jenis || tipe_tryout || ""),
     ip: req.ip,
   };
 
@@ -856,6 +939,12 @@ app.post("/process-tryout-user", async (req, res) => {
   };
 
   try {
+    const normalizedJenis = await resolveJenisTryout(conn, idTryout, jenis || tipe_tryout);
+    const isKedinasan = isKedinasanJenis(normalizedJenis);
+    const isUmUgm = isUmUgmJenis(normalizedJenis);
+    const isSimakUi = isSimakUiJenis(normalizedJenis);
+    const isUmUns = isUmUnsJenis(normalizedJenis);
+
     let stepStart = Date.now();
     await conn.beginTransaction();
     mark("begin_transaction_ms", stepStart);
@@ -1024,6 +1113,48 @@ app.post("/process-tryout-user", async (req, res) => {
           `,
           [idTryout, idUser, idTryout, idUser]
         )
+      : isUmUns
+      ? await conn.query(
+          `
+          SELECT
+            ju.id_user,
+            COALESCE(SUM(
+              CASE
+                WHEN ju.id_mapel = 51 THEN
+                  CASE
+                    WHEN ju.jawaban = st.kunci THEN 4
+                    WHEN COALESCE(ju.jawaban, '') = '' THEN 0
+                    ELSE -1
+                  END
+                WHEN ju.id_mapel IN (53, 54, 55) THEN
+                  CASE
+                    WHEN ju.status = 'benar' THEN st.point * 100
+                    ELSE 0
+                  END
+                ELSE 0
+              END
+            ), 0) AS raw_total,
+            COALESCE(MAX(NULLIF(ju.peminatan, '')), 'ipc') AS peminatan
+          FROM (
+            SELECT j1.*
+            FROM jawaban_user_tryout_pembahasan j1
+            JOIN (
+              SELECT MAX(id) AS max_id
+              FROM jawaban_user_tryout_pembahasan
+              WHERE id_tryout = ? AND id_user = ?
+              GROUP BY id_user, id_tryout, id_mapel, no_soal
+            ) lx ON lx.max_id = j1.id
+          ) ju
+          JOIN soal_tryout st
+            ON st.no_soal = ju.no_soal
+           AND st.id_mapel = ju.id_mapel
+           AND st.id_tryout = ju.id_tryout
+          WHERE ju.id_tryout = ? AND ju.id_user = ?
+            AND ju.id_mapel IN (51, 53, 54, 55)
+          GROUP BY ju.id_user
+          `,
+          [idTryout, idUser, idTryout, idUser]
+        )
       : await conn.query(
           `
           SELECT
@@ -1058,7 +1189,7 @@ app.post("/process-tryout-user", async (req, res) => {
                 ELSE 0
               END
             ), 0) AS raw_total,
-            COALESCE(MAX(NULLIF(ju.peminatan, '')), 'Saintek') AS peminatan
+            COALESCE(MAX(NULLIF(ju.peminatan, '')), ${isUmUns ? "'ipc'" : "'Saintek'"}) AS peminatan
           FROM (
             SELECT j1.*
             FROM jawaban_user_tryout_pembahasan j1
@@ -1095,7 +1226,7 @@ app.post("/process-tryout-user", async (req, res) => {
     }
 
     const rawTotal = Number(scoreRows[0].raw_total || 0);
-    const userPeminatan = scoreRows[0].peminatan || ((isKedinasan || isSimakUi) ? "ipc" : "Saintek");
+    const userPeminatan = scoreRows[0].peminatan || ((isKedinasan || isSimakUi || isUmUns) ? "ipc" : "Saintek");
     let finalTotal = (isUmUgm || isSimakUi)
       ? (rawTotal / (isSimakUi ? 420 : 360)) * 1000
       : (normalizedJenis === "tka" || isKedinasan
