@@ -177,82 +177,6 @@ async function buildLatestJawabanTempTable(conn, idTryout) {
   );
 }
 
-async function buildLatestJawabanTempTableFromV2(conn, idTryout) {
-  const [latestRows] = await conn.query(
-    `
-    SELECT v.id_user, v.id_tryout, v.id_mapel, v.peminatan, v.jawaban_user_permapel
-    FROM jawaban_user_tryout_v2 v
-    JOIN (
-      SELECT MAX(id) AS max_id
-      FROM jawaban_user_tryout_v2
-      WHERE id_tryout = ?
-      GROUP BY id_user, id_tryout, id_mapel
-    ) x ON x.max_id = v.id
-    `,
-    [idTryout]
-  );
-
-  await conn.query(`DROP TEMPORARY TABLE IF EXISTS tmp_latest_jawaban`);
-  await conn.query(
-    `
-    CREATE TEMPORARY TABLE tmp_latest_jawaban (
-      id_user BIGINT NOT NULL,
-      id_tryout BIGINT NOT NULL,
-      id_mapel BIGINT NOT NULL,
-      no_soal INT NOT NULL,
-      status VARCHAR(20),
-      jawaban TEXT,
-      peminatan VARCHAR(50),
-      INDEX idx_lj_mapel_soal (id_mapel, no_soal),
-      INDEX idx_lj_user (id_user),
-      INDEX idx_lj_status (status)
-    )
-    `
-  );
-
-  const values = [];
-  latestRows.forEach((row) => {
-    try {
-      const answers = JSON.parse(row.jawaban_user_permapel || "[]");
-      if (!Array.isArray(answers)) return;
-      answers.forEach((answer) => {
-        const noSoal = Number(answer?.no_soal);
-        if (!Number.isFinite(noSoal)) return;
-        values.push([
-          Number(row.id_user),
-          Number(row.id_tryout),
-          Number(answer?.id_mapel || row.id_mapel),
-          noSoal,
-          (answer?.status || "").toString().replace(/"/g, ""),
-          (answer?.jawaban ?? "").toString().replace(/"/g, ""),
-          (answer?.peminatan || row.peminatan || "").toString().replace(/"/g, ""),
-        ]);
-      });
-    } catch (error) {
-      logProcessTryoutUser("warn", "skip invalid answer JSON during weighting", {
-        idTryout,
-        idUser: row.id_user,
-        idMapel: row.id_mapel,
-        error: error.message,
-      });
-    }
-  });
-
-  const CHUNK_SIZE = 3000;
-  for (let i = 0; i < values.length; i += CHUNK_SIZE) {
-    await conn.query(
-      `
-      INSERT INTO tmp_latest_jawaban
-      (id_user, id_tryout, id_mapel, no_soal, status, jawaban, peminatan)
-      VALUES ?
-      `,
-      [values.slice(i, i + CHUNK_SIZE)]
-    );
-  }
-
-  return { sourceRows: latestRows.length, answerRows: values.length };
-}
-
 async function autoSetBobotSoalByTryout(conn, idTryout) {
   const [mapels] = await conn.query(
     `
@@ -367,7 +291,7 @@ async function shouldSkipAutoWeighting(conn, idTryout) {
     `
     SELECT
       COUNT(*) AS total_soal,
-      SUM(CASE WHEN point IS NOT NULL AND point > 0 THEN 1 ELSE 0 END) AS soal_berbobot
+      SUM(CASE WHEN point IS NOT NULL THEN 1 ELSE 0 END) AS soal_berbobot
     FROM soal_tryout
     WHERE id_tryout = ?
   `,
@@ -1001,18 +925,27 @@ app.post("/process-tryout-user/status", async (req, res) => {
         `
         SELECT
           COUNT(*) AS total_soal,
-          SUM(CASE WHEN point IS NOT NULL AND point > 0 THEN 1 ELSE 0 END) AS soal_berbobot
+          SUM(CASE WHEN point IS NOT NULL THEN 1 ELSE 0 END) AS soal_berbobot
         FROM soal_tryout
         WHERE id_tryout = ?
         `,
         [idTryout]
       ).then(([rows]) => rows),
       pool.query(
-        `SELECT id, total, \`rank\` FROM rank_tryout_2025 WHERE id_tryout = ? AND id_user = ? LIMIT 1`,
+        `SELECT total, \`rank\` FROM rank_tryout_2025 WHERE id_tryout = ? AND id_user = ? LIMIT 1`,
         [idTryout, idUser]
       ).then(([rows]) => rows),
       pool.query(
-        `SELECT id FROM jawaban_user_tryout_v2 WHERE id_tryout = ? AND id_user = ? LIMIT 1`,
+        `
+        SELECT COUNT(*) AS total_mapel, COALESCE(SUM(v.benar), 0) AS total_benar
+        FROM jawaban_user_tryout_v2 v
+        JOIN (
+          SELECT MAX(id) AS max_id
+          FROM jawaban_user_tryout_v2
+          WHERE id_tryout = ? AND id_user = ?
+          GROUP BY id_user, id_tryout, id_mapel
+        ) x ON x.max_id = v.id
+        `,
         [idTryout, idUser]
       ).then(([rows]) => rows),
     ]);
@@ -1021,8 +954,13 @@ app.post("/process-tryout-user/status", async (req, res) => {
     const totalSoal = Number(pointStatus.total_soal || 0);
     const soalBerbobot = Number(pointStatus.soal_berbobot || 0);
     const pointsReady = totalSoal > 0 && soalBerbobot === totalSoal;
-    const rankReady = rankRows.length > 0 && rankRows[0].total !== null;
-    const hasAnswers = answerRows.length > 0;
+    const totalBenar = Number(answerRows[0]?.total_benar || 0);
+    const hasAnswers = Number(answerRows[0]?.total_mapel || 0) > 0;
+    const rankTotal = rankRows.length > 0 && rankRows[0].total !== null
+      ? Number(rankRows[0].total)
+      : null;
+    const staleZeroRank = pointsReady && totalBenar > 0 && rankTotal === 0;
+    const rankReady = rankTotal !== null && !staleZeroRank;
 
     return res.json({
       success: true,
@@ -1035,6 +973,9 @@ app.post("/process-tryout-user/status", async (req, res) => {
         needsProcessing: hasAnswers && (!pointsReady || !rankReady),
         totalSoal,
         soalBerbobot,
+        totalBenar,
+        rankTotal,
+        staleZeroRank,
       },
     });
   } catch (error) {
@@ -1067,9 +1008,6 @@ app.post("/process-tryout-user", async (req, res) => {
   const conn = await pool.getConnection();
   const processStart = Date.now();
   const timings = {};
-  const weightingLockName = `pengumuman_weight_${Number(idTryout)}`;
-  let weightingLockAcquired = false;
-  let weightSummary = null;
   const mark = (name, startAt) => {
     timings[name] = Date.now() - startAt;
   };
@@ -1080,19 +1018,6 @@ app.post("/process-tryout-user", async (req, res) => {
     const isUmUgm = isUmUgmJenis(normalizedJenis);
     const isSimakUi = isSimakUiJenis(normalizedJenis);
     const isUmUns = isUmUnsJenis(normalizedJenis);
-
-    const initialWeightGuard = await shouldSkipAutoWeighting(conn, idTryout);
-    const requiresAutoWeighting = !isKedinasan && !isSimakUi && !initialWeightGuard.skip;
-    if (requiresAutoWeighting) {
-      const [[lockResult]] = await conn.query(
-        `SELECT GET_LOCK(?, 120) AS acquired`,
-        [weightingLockName]
-      );
-      weightingLockAcquired = Number(lockResult?.acquired || 0) === 1;
-      if (!weightingLockAcquired) {
-        throw new Error("Proses bobot soal sedang sibuk. Silakan coba lagi sebentar.");
-      }
-    }
 
     let stepStart = Date.now();
     await conn.beginTransaction();
@@ -1217,37 +1142,6 @@ app.post("/process-tryout-user", async (req, res) => {
       latestV2Rows.map((x) => x.id)
     );
     mark("refresh_pembahasan_v2_ms", stepStart);
-
-    // Bobot soal dibuat satu kali oleh user pertama jika admin belum memprosesnya.
-    // Perhitungan memakai jawaban terbaru seluruh peserta, tetapi ranking tetap hanya user ini.
-    stepStart = Date.now();
-    const latestWeightGuard = await shouldSkipAutoWeighting(conn, idTryout);
-    weightSummary = {
-      updatedRows: 0,
-      mapelCount: 0,
-      skipped: true,
-      reason: "all_soal_already_weighted",
-      guard: latestWeightGuard,
-    };
-    if (isKedinasan) {
-      weightSummary.reason = "not_required_for_kedinasan";
-    } else if (isSimakUi) {
-      weightSummary.reason = "not_required_for_simak_ui";
-    } else if (!latestWeightGuard.skip) {
-      const sourceSummary = await buildLatestJawabanTempTableFromV2(conn, idTryout);
-      if (sourceSummary.answerRows === 0) {
-        throw new Error("Belum ada jawaban valid untuk menghitung bobot soal");
-      }
-      const autoWeightResult = await autoSetBobotSoalByTryout(conn, idTryout);
-      weightSummary = {
-        ...autoWeightResult,
-        skipped: false,
-        reason: "generated_by_first_user",
-        guard: latestWeightGuard,
-        source: sourceSummary,
-      };
-    }
-    mark("ensure_auto_weighting_ms", stepStart);
 
     // 6) Hitung total user (tanpa proses massal semua peserta)
     stepStart = Date.now();
@@ -1509,7 +1403,6 @@ app.post("/process-tryout-user", async (req, res) => {
         total: finalTotal,
         rank: userRank,
         deleted_cache_keys: cacheClear.deleted,
-        auto_weighting: weightSummary,
       },
       timings,
     });
@@ -1526,13 +1419,6 @@ app.post("/process-tryout-user", async (req, res) => {
     });
     return res.status(500).json({ success: false, error: err.message });
   } finally {
-    if (weightingLockAcquired) {
-      try {
-        await conn.query(`SELECT RELEASE_LOCK(?)`, [weightingLockName]);
-      } catch (releaseError) {
-        console.error("Release weighting lock error:", releaseError);
-      }
-    }
     conn.release();
   }
 });
