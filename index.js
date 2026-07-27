@@ -793,7 +793,9 @@ app.post("/process-tryout", async (req, res) => {
               jut.id_user,
               u.username,
               COALESCE(MAX(NULLIF(jut.peminatan, '')), 'Saintek') AS peminatan,
-              (
+              LEAST(
+                CASE WHEN ? = 'tka' THEN 500 ELSE 999999999 END,
+                (
                 SUM(
                   CASE
                     WHEN jut.status = 'benar' THEN
@@ -810,6 +812,7 @@ app.post("/process-tryout", async (req, res) => {
                   WHEN ? = 'umptkin' THEN NULLIF(COUNT(DISTINCT jut.id_mapel), 0)
                   ELSE 7
                 END
+                )
               ) AS total
             FROM tmp_latest_jawaban jut
             JOIN soal_tryout st
@@ -822,7 +825,7 @@ app.post("/process-tryout", async (req, res) => {
         ) r
         LEFT JOIN userdata ud ON ud.id_user = r.id_user;
         `,
-        [idTryout, normalizedJenis, normalizedJenis, normalizedJenis]
+        [idTryout, normalizedJenis, normalizedJenis, normalizedJenis, normalizedJenis]
       );
     }
     mark("insert_rank_ms", stepStart);
@@ -1308,6 +1311,8 @@ app.post("/process-tryout-user", async (req, res) => {
         : rawTotal / 7);
     if (isSimakUi) {
       finalTotal = Math.max(0, Math.min(1000, finalTotal));
+    } else if (normalizedJenis === "tka") {
+      finalTotal = Math.max(0, Math.min(500, finalTotal));
     }
 
     // 7) Upsert ranking user ke rank_tryout_2025
