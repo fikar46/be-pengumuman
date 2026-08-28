@@ -475,6 +475,59 @@ async function autoSetBobotSoalByTryout(conn, idTryout) {
   return { updatedRows: updateResult.affectedRows || 0, mapelCount: mapels.length };
 }
 
+// Formula ini sengaja disamakan dengan tombol "Simpan Semua Point" di admin:
+// (1 - benar / (benar + salah)) / (jumlah soal yang muncul / 10).
+async function saveAdminStylePointsByTryout(conn, idTryout) {
+  const [rows] = await conn.query(
+    `
+    SELECT
+      st.id_mapel,
+      st.no_soal,
+      SUM(CASE WHEN jut.status = 'benar' THEN 1 ELSE 0 END) AS benar,
+      SUM(CASE WHEN jut.status = 'salah' THEN 1 ELSE 0 END) AS salah
+    FROM jawaban_user_tryout jut
+    JOIN soal_tryout st
+      ON st.id_tryout = jut.id_tryout
+     AND st.id_mapel = jut.id_mapel
+     AND st.no_soal = jut.no_soal
+    WHERE jut.id_tryout = ?
+    GROUP BY st.id_mapel, st.no_soal
+    ORDER BY st.id_mapel, st.no_soal
+    `,
+    [idTryout]
+  );
+
+  const rowsByMapel = new Map();
+  rows.forEach((row) => {
+    const idMapel = Number(row.id_mapel);
+    if (!rowsByMapel.has(idMapel)) rowsByMapel.set(idMapel, []);
+    rowsByMapel.get(idMapel).push(row);
+  });
+
+  let updatedRows = 0;
+  rowsByMapel.forEach((mapelRows) => {
+    mapelRows.forEach((row) => {
+      const benar = Number(row.benar || 0);
+      const salah = Number(row.salah || 0);
+      const jumlah = benar + salah;
+      if (!jumlah) return;
+      const score = (1 - (benar / jumlah)) / (mapelRows.length / 10);
+      row.__score = score;
+    });
+  });
+
+  for (const row of rows) {
+    if (row.__score === undefined) continue;
+    const [result] = await conn.query(
+      `UPDATE soal_tryout SET point = ? WHERE id_tryout = ? AND id_mapel = ? AND no_soal = ?`,
+      [row.__score, idTryout, row.id_mapel, row.no_soal]
+    );
+    updatedRows += result.affectedRows || 0;
+  }
+
+  return { updatedRows, mapelCount: rowsByMapel.size };
+}
+
 async function shouldSkipAutoWeighting(conn, idTryout) {
   const [rows] = await conn.query(
     `
@@ -712,12 +765,18 @@ app.post("/process-tryout", async (req, res) => {
         skipped: true,
         reason: "not_required_for_simak_ui",
       };
-    } else if (forceReweight || !weightGuard.skip) {
+    } else if (forceReweight && ["sbmptn", "snbt"].includes(normalizedJenis)) {
+      const autoWeightResult = await saveAdminStylePointsByTryout(conn, idTryout);
+      weightSummary = {
+        ...weightSummary,
+        ...autoWeightResult,
+        reason: "admin_simpan_semua_point_formula",
+      };
+    } else if (!weightGuard.skip) {
       const autoWeightResult = await autoSetBobotSoalByTryout(conn, idTryout);
       weightSummary = {
         ...weightSummary,
         ...autoWeightResult,
-        reason: forceReweight ? "nightly_reweight" : null,
       };
     } else {
       weightSummary = {
