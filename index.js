@@ -45,6 +45,7 @@ const pool = mysql.createPool({
 const AUTO_WEIGHT_MIN_TOTAL = 9.5;
 const AUTO_WEIGHT_MAX_TOTAL = 10;
 const AUTO_WEIGHT_TARGET_TOTAL = 9.5;
+const PROVISIONAL_SNAPSHOT_TTL_MS = 2 * 60 * 1000;
 
 function normalizeJenis(jenis = "") {
   return (jenis || "").toString().trim().toLowerCase();
@@ -309,6 +310,286 @@ async function shouldSkipAutoWeighting(conn, idTryout) {
     skip: totalSoal > 0 && soalBerbobot === totalSoal,
     total_soal: totalSoal,
     soal_berbobot: soalBerbobot,
+  };
+}
+
+async function ensureProvisionalResultTables(conn) {
+  await conn.query(`
+    CREATE TABLE IF NOT EXISTS tryout_provisional_snapshot (
+      id_tryout BIGINT NOT NULL,
+      participant_count INT NOT NULL DEFAULT 0,
+      snapshot_at DATETIME NOT NULL,
+      PRIMARY KEY (id_tryout)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+  await conn.query(`
+    CREATE TABLE IF NOT EXISTS rank_tryout_provisional (
+      id_tryout BIGINT NOT NULL,
+      id_user BIGINT NOT NULL,
+      username VARCHAR(255) NOT NULL DEFAULT '',
+      peminatan VARCHAR(50) NOT NULL DEFAULT 'ipc',
+      total DECIMAL(12,4) NOT NULL DEFAULT 0,
+      instansi VARCHAR(255) NULL,
+      provinsi VARCHAR(100) NULL,
+      province_name VARCHAR(255) NULL,
+      rank_position INT NOT NULL DEFAULT 0,
+      subtests_json LONGTEXT NULL,
+      snapshot_at DATETIME NOT NULL,
+      PRIMARY KEY (id_tryout, id_user),
+      INDEX idx_provisional_rank (id_tryout, rank_position),
+      INDEX idx_provisional_province (id_tryout, provinsi, total)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+}
+
+function provisionalQuestionKey(idMapel, noSoal) {
+  return `${Number(idMapel)}:${Number(noSoal)}`;
+}
+
+function parseLatestProvisionalAnswers(latestRows = []) {
+  const answersByUser = new Map();
+  latestRows.forEach((row) => {
+    let parsed = [];
+    try {
+      parsed = JSON.parse(row.jawaban_user_permapel || "[]");
+    } catch (error) {
+      return;
+    }
+    if (!Array.isArray(parsed)) return;
+
+    const idUser = Number(row.id_user);
+    if (!answersByUser.has(idUser)) {
+      answersByUser.set(idUser, {
+        idUser,
+        username: row.username || "",
+        peminatan: row.peminatan || "ipc",
+        instansi: row.instansi || null,
+        provinsi: row.provinsi === null || row.provinsi === undefined ? null : String(row.provinsi),
+        provinceName: row.province_name || null,
+        answers: [],
+      });
+    }
+    const user = answersByUser.get(idUser);
+    parsed.forEach((item) => {
+      const idMapel = Number(item?.id_mapel || row.id_mapel);
+      const noSoal = Number(item?.no_soal);
+      if (!Number.isFinite(idMapel) || !Number.isFinite(noSoal)) return;
+      user.answers.push({
+        idMapel,
+        noSoal,
+        status: String(item?.status || "").trim().toLowerCase(),
+      });
+    });
+  });
+  return answersByUser;
+}
+
+function buildProvisionalWeights(questionRows = [], answersByUser = new Map()) {
+  const questionStats = new Map();
+  const questionsByMapel = new Map();
+  questionRows.forEach((row) => {
+    const idMapel = Number(row.id_mapel);
+    const noSoal = Number(row.no_soal);
+    const key = provisionalQuestionKey(idMapel, noSoal);
+    questionStats.set(key, { attempts: 0, benar: 0, idMapel, noSoal });
+    if (!questionsByMapel.has(idMapel)) questionsByMapel.set(idMapel, []);
+    questionsByMapel.get(idMapel).push(key);
+  });
+
+  answersByUser.forEach((user) => {
+    user.answers.forEach((answer) => {
+      const stat = questionStats.get(provisionalQuestionKey(answer.idMapel, answer.noSoal));
+      if (!stat || !["benar", "salah"].includes(answer.status)) return;
+      stat.attempts += 1;
+      if (answer.status === "benar") stat.benar += 1;
+    });
+  });
+
+  const weights = new Map();
+  questionsByMapel.forEach((keys) => {
+    const rawValues = keys.map((key) => {
+      const stat = questionStats.get(key);
+      return stat.attempts <= 0 ? 0.5 : 1 - (stat.benar / stat.attempts);
+    });
+    const rawTotal = rawValues.reduce((sum, value) => sum + value, 0);
+    const avgRaw = rawValues.length > 0 ? rawTotal / rawValues.length : 0.5;
+    const targetTotal = Math.min(
+      AUTO_WEIGHT_MAX_TOTAL,
+      Math.max(AUTO_WEIGHT_MIN_TOTAL, AUTO_WEIGHT_TARGET_TOTAL + (0.5 * avgRaw))
+    );
+    keys.forEach((key, index) => {
+      const point = rawTotal > 0
+        ? (rawValues[index] / rawTotal) * targetTotal
+        : targetTotal / Math.max(keys.length, 1);
+      weights.set(key, point);
+    });
+  });
+  return weights;
+}
+
+function calculateProvisionalRanking(questionRows = [], answersByUser = new Map()) {
+  const weights = buildProvisionalWeights(questionRows, answersByUser);
+  const mapelMeta = new Map();
+  questionRows.forEach((row) => {
+    const idMapel = Number(row.id_mapel);
+    if (!mapelMeta.has(idMapel)) {
+      mapelMeta.set(idMapel, {
+        id: idMapel,
+        nama: row.nama_mapel || `Subtes ${idMapel}`,
+        no: Number(row.no_mapel || 0),
+      });
+    }
+  });
+
+  const ranking = [];
+  answersByUser.forEach((user) => {
+    if (!user.answers.length) return;
+    const subtestScores = new Map();
+    user.answers.forEach((answer) => {
+      if (!subtestScores.has(answer.idMapel)) subtestScores.set(answer.idMapel, 0);
+      if (answer.status === "benar") {
+        const point = weights.get(provisionalQuestionKey(answer.idMapel, answer.noSoal)) || 0;
+        subtestScores.set(answer.idMapel, subtestScores.get(answer.idMapel) + (point * 100));
+      }
+    });
+    const subtests = Array.from(subtestScores.entries())
+      .map(([idMapel, nilai]) => ({ ...(mapelMeta.get(idMapel) || { id: idMapel, nama: `Subtes ${idMapel}`, no: 0 }), nilai }))
+      .sort((a, b) => a.no - b.no || a.id - b.id);
+    const scoreSum = subtests.reduce((sum, item) => sum + Number(item.nilai || 0), 0);
+    ranking.push({ ...user, total: scoreSum / 7, subtests });
+  });
+
+  ranking.sort((a, b) => b.total - a.total || a.idUser - b.idUser);
+  ranking.forEach((item, index) => { item.rank = index + 1; });
+  return ranking;
+}
+
+async function rebuildProvisionalSnapshot(conn, idTryout) {
+  const [latestRows, questionRows] = await Promise.all([
+    conn.query(
+      `
+      SELECT
+        v.id_user,
+        v.id_mapel,
+        v.peminatan,
+        v.jawaban_user_permapel,
+        u.username,
+        ud.instansi,
+        ud.provinsi,
+        p.province_name
+      FROM jawaban_user_tryout_v2 v
+      JOIN (
+        SELECT MAX(v2.id) AS max_id
+        FROM jawaban_user_tryout_v2 v2
+        JOIN (
+          SELECT DISTINCT id_user
+          FROM status_tryout
+          WHERE id_tryout = ? AND LOWER(COALESCE(status, '')) = 'done'
+        ) finished ON finished.id_user = v2.id_user
+        WHERE v2.id_tryout = ?
+        GROUP BY v2.id_user, v2.id_tryout, v2.id_mapel
+      ) latest ON latest.max_id = v.id
+      JOIN users u ON u.id = v.id_user
+      LEFT JOIN userdata ud ON ud.id_user = v.id_user
+      LEFT JOIN province p ON p.id = ud.provinsi
+      WHERE v.id_tryout = ?
+      `,
+      [idTryout, idTryout, idTryout]
+    ).then(([rows]) => rows),
+    conn.query(
+      `
+      SELECT st.id_mapel, st.no_soal, mp.nama AS nama_mapel, mp.no AS no_mapel
+      FROM soal_tryout st
+      JOIN mata_pelajaran mp ON mp.id = st.id_mapel
+      WHERE st.id_tryout = ?
+      ORDER BY mp.no ASC, st.no_soal ASC
+      `,
+      [idTryout]
+    ).then(([rows]) => rows),
+  ]);
+
+  const answersByUser = parseLatestProvisionalAnswers(latestRows);
+  const ranking = calculateProvisionalRanking(questionRows, answersByUser);
+  const snapshotAt = new Date();
+
+  await conn.beginTransaction();
+  try {
+    await conn.query(`DELETE FROM rank_tryout_provisional WHERE id_tryout = ?`, [idTryout]);
+    if (ranking.length) {
+      const values = ranking.map((item) => [
+        Number(idTryout), item.idUser, item.username, item.peminatan || "ipc", item.total,
+        item.instansi, item.provinsi, item.provinceName, item.rank,
+        JSON.stringify(item.subtests), snapshotAt,
+      ]);
+      await conn.query(
+        `
+        INSERT INTO rank_tryout_provisional
+          (id_tryout, id_user, username, peminatan, total, instansi, provinsi, province_name, rank_position, subtests_json, snapshot_at)
+        VALUES ?
+        `,
+        [values]
+      );
+    }
+    await conn.query(
+      `
+      INSERT INTO tryout_provisional_snapshot (id_tryout, participant_count, snapshot_at)
+      VALUES (?, ?, ?)
+      ON DUPLICATE KEY UPDATE participant_count = VALUES(participant_count), snapshot_at = VALUES(snapshot_at)
+      `,
+      [idTryout, ranking.length, snapshotAt]
+    );
+    await conn.commit();
+  } catch (error) {
+    await conn.rollback();
+    throw error;
+  }
+  return { ranking, snapshotAt };
+}
+
+async function readProvisionalResult(conn, idTryout, idUser) {
+  const [[snapshotRows], [leaderboardRows]] = await Promise.all([
+    conn.query(
+      `SELECT participant_count, snapshot_at FROM tryout_provisional_snapshot WHERE id_tryout = ? LIMIT 1`,
+      [idTryout]
+    ),
+    conn.query(
+      `
+      SELECT id_user, username, peminatan, total, instansi, provinsi, province_name,
+             rank_position AS \`rank\`, subtests_json, snapshot_at
+      FROM rank_tryout_provisional
+      WHERE id_tryout = ?
+      ORDER BY rank_position ASC
+      `,
+      [idTryout]
+    ),
+  ]);
+  const snapshot = snapshotRows[0] || null;
+  const leaderboard = leaderboardRows.map((row) => ({
+    id_user: Number(row.id_user),
+    username: row.username,
+    peminatan: row.peminatan,
+    total: Number(row.total || 0),
+    instansi: row.instansi,
+    provinsi: row.provinsi,
+    province_name: row.province_name,
+    rank: Number(row.rank || 0),
+  }));
+  const rawUser = leaderboardRows.find((row) => Number(row.id_user) === Number(idUser));
+  let subtests = [];
+  if (rawUser?.subtests_json) {
+    try { subtests = JSON.parse(rawUser.subtests_json); } catch (error) { subtests = []; }
+  }
+  return {
+    snapshot,
+    leaderboard,
+    user: rawUser ? {
+      id_user: Number(rawUser.id_user),
+      username: rawUser.username,
+      peminatan: rawUser.peminatan,
+      total: Number(rawUser.total || 0),
+      rank: Number(rawUser.rank || 0),
+      subtests,
+    } : null,
   };
 }
 
@@ -909,6 +1190,130 @@ app.post("/process-tryout", async (req, res) => {
     console.error(err);
     res.status(500).json({ success: false, error: err.message });
   } finally {
+    conn.release();
+  }
+});
+
+app.post("/provisional-results", async (req, res) => {
+  const { idTryout, idUser } = req.body;
+  if (!idTryout || !idUser) {
+    return res.status(400).json({ success: false, message: "idTryout dan idUser wajib diisi" });
+  }
+
+  const conn = await pool.getConnection();
+  const lockName = `provisional_tryout_${Number(idTryout)}`;
+  let lockAcquired = false;
+  try {
+    await ensureProvisionalResultTables(conn);
+
+    const [[tryoutRows], [accessRows], [statusRows]] = await Promise.all([
+      conn.query(`SELECT jenis, tipe_tryout FROM tryout WHERE id = ? LIMIT 1`, [idTryout]),
+      conn.query(
+        `
+        SELECT (
+          EXISTS(
+            SELECT 1
+            FROM pendaftaran_tryout_user ptu
+            WHERE ptu.id_tryout = ? AND ptu.id_user = ?
+              AND LOWER(COALESCE(ptu.jenis_pendaftaran, '')) IN ('siappoin', 'berbayar')
+              AND LOWER(COALESCE(ptu.status_pendaftaran, 'verified')) IN ('verified', 'settlement', 'capture', 'terdaftar')
+          )
+          OR EXISTS(
+            SELECT 1
+            FROM siapbimbel sb
+            WHERE sb.id_user = ? AND sb.end_date >= NOW()
+              AND LOWER(COALESCE(sb.jenis, '')) NOT IN ('siapbelajar_mini_kedinasan', 'siapbelajar_mini_mandiri')
+          )
+        ) AS allowed
+        `,
+        [idTryout, idUser, idUser]
+      ),
+      conn.query(
+        `
+        SELECT 1 AS finished
+        FROM status_tryout
+        WHERE id_tryout = ? AND id_user = ? AND LOWER(COALESCE(status, '')) = 'done'
+        LIMIT 1
+        `,
+        [idTryout, idUser]
+      ),
+    ]);
+
+    if (!tryoutRows.length) {
+      return res.status(404).json({ success: false, code: "TRYOUT_NOT_FOUND", message: "Tryout tidak ditemukan" });
+    }
+    const jenisCandidates = [tryoutRows[0].jenis, tryoutRows[0].tipe_tryout].map(normalizeJenis);
+    if (!jenisCandidates.some((jenis) => jenis === "sbmptn" || jenis === "snbt")) {
+      return res.status(400).json({
+        success: false,
+        code: "UNSUPPORTED_TRYOUT_TYPE",
+        message: "Hasil sementara saat ini hanya tersedia untuk tryout SNBT",
+      });
+    }
+    if (!Number(accessRows?.[0]?.allowed || 0)) {
+      return res.status(403).json({
+        success: false,
+        code: "PREMIUM_REQUIRED",
+        message: "Hasil sementara hanya dapat dibuka oleh user Premium",
+      });
+    }
+    if (!statusRows.length) {
+      return res.status(409).json({
+        success: false,
+        code: "TRYOUT_NOT_FINISHED",
+        message: "Selesaikan tryout terlebih dahulu untuk melihat hasil sementara",
+      });
+    }
+
+    let result = await readProvisionalResult(conn, idTryout, idUser);
+    const snapshotTime = result.snapshot?.snapshot_at
+      ? new Date(result.snapshot.snapshot_at).getTime()
+      : 0;
+    const snapshotIsFresh = snapshotTime > 0 && Date.now() - snapshotTime < PROVISIONAL_SNAPSHOT_TTL_MS;
+
+    if (!snapshotIsFresh) {
+      const [[lockRows]] = await conn.query(`SELECT GET_LOCK(?, 0) AS acquired`, [lockName]);
+      lockAcquired = Number(lockRows?.[0]?.acquired || 0) === 1;
+      if (lockAcquired) {
+        await rebuildProvisionalSnapshot(conn, idTryout);
+        result = await readProvisionalResult(conn, idTryout, idUser);
+      } else if (!result.snapshot) {
+        return res.status(202).json({
+          success: true,
+          status: "processing",
+          provisional: true,
+          message: "Hasil sementara sedang dihitung",
+        });
+      }
+    }
+
+    if (!result.user) {
+      return res.status(202).json({
+        success: true,
+        status: "processing",
+        provisional: true,
+        participantCount: Number(result.snapshot?.participant_count || 0),
+        asOf: result.snapshot?.snapshot_at || null,
+        message: "Jawaban selesai ditemukan dan hasil sementara sedang disiapkan",
+      });
+    }
+
+    return res.json({
+      success: true,
+      status: "ready",
+      provisional: true,
+      participantCount: Number(result.snapshot?.participant_count || result.leaderboard.length),
+      asOf: result.snapshot?.snapshot_at || result.user.snapshot_at || null,
+      user: result.user,
+      leaderboard: result.leaderboard,
+    });
+  } catch (error) {
+    console.error("[provisional-results] failed", { idTryout, idUser, message: error.message });
+    return res.status(500).json({ success: false, error: error.message });
+  } finally {
+    if (lockAcquired) {
+      try { await conn.query(`SELECT RELEASE_LOCK(?)`, [lockName]); } catch (error) {}
+    }
     conn.release();
   }
 });
