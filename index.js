@@ -1,6 +1,7 @@
 import express from "express";
 import mysql from "mysql2/promise";
 import Redis from "ioredis";
+import http from "http";
 
 const app = express();
 app.use((req, res, next) => {
@@ -45,7 +46,8 @@ const pool = mysql.createPool({
 const AUTO_WEIGHT_MIN_TOTAL = 9.5;
 const AUTO_WEIGHT_MAX_TOTAL = 10;
 const AUTO_WEIGHT_TARGET_TOTAL = 9.5;
-const PROVISIONAL_SNAPSHOT_TTL_MS = 2 * 60 * 1000;
+const NIGHTLY_SCHEDULER_INTERVAL_MS = 30 * 1000;
+const NIGHTLY_SCHEDULER_TIME_ZONE = "Asia/Jakarta";
 
 function normalizeJenis(jenis = "") {
   return (jenis || "").toString().trim().toLowerCase();
@@ -115,6 +117,157 @@ function userNotAttemptedResponse(message = "Kamu belum mengerjakan tryout ini, 
     code: "USER_NOT_ATTEMPTED",
     message,
   };
+}
+
+function getJakartaDateParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: NIGHTLY_SCHEDULER_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date).reduce((result, item) => {
+    result[item.type] = item.value;
+    return result;
+  }, {});
+  return {
+    date: `${parts.year}-${parts.month}-${parts.day}`,
+    hour: Number(parts.hour),
+    minute: Number(parts.minute),
+  };
+}
+
+async function ensureNightlySchedulerTable(conn) {
+  await conn.query(`
+    CREATE TABLE IF NOT EXISTS tryout_nightly_process_log (
+      id BIGINT NOT NULL AUTO_INCREMENT,
+      id_tryout BIGINT NOT NULL,
+      process_date DATE NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'running',
+      started_at DATETIME NOT NULL,
+      finished_at DATETIME NULL,
+      error_message TEXT NULL,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_tryout_process_date (id_tryout, process_date),
+      INDEX idx_nightly_status (status, process_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+}
+
+function postLocalPengumuman(path, payload = {}, timeoutMs = 15 * 60 * 1000) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const request = http.request({
+      hostname: "127.0.0.1",
+      port: 2234,
+      path,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+      timeout: timeoutMs,
+    }, (response) => {
+      let responseBody = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => { responseBody += chunk; });
+      response.on("end", () => {
+        let parsed = {};
+        try { parsed = responseBody ? JSON.parse(responseBody) : {}; } catch (error) {}
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          resolve(parsed);
+          return;
+        }
+        reject(new Error(parsed.message || parsed.error || `HTTP ${response.statusCode}`));
+      });
+    });
+    request.on("timeout", () => request.destroy(new Error("Nightly process timeout")));
+    request.on("error", reject);
+    request.write(body);
+    request.end();
+  });
+}
+
+let nightlySchedulerRunning = false;
+async function runNightlyTryoutScheduler() {
+  const jakartaNow = getJakartaDateParts();
+  if (jakartaNow.hour !== 23 || jakartaNow.minute !== 59 || nightlySchedulerRunning) {
+    return;
+  }
+
+  nightlySchedulerRunning = true;
+  const conn = await pool.getConnection();
+  try {
+    await ensureNightlySchedulerTable(conn);
+    const [tryoutRows] = await conn.query(
+      `
+      SELECT id
+      FROM tryout
+      WHERE (LOWER(COALESCE(jenis, '')) IN ('sbmptn', 'snbt')
+             OR LOWER(COALESCE(tipe_tryout, '')) IN ('sbmptn', 'snbt'))
+        AND DATE(start_time) <= ?
+        AND DATE_ADD(DATE(end_time), INTERVAL 1 DAY) >= ?
+      `,
+      [jakartaNow.date, jakartaNow.date]
+    );
+
+    for (const tryout of tryoutRows) {
+      const lockName = `nightly_tryout_${tryout.id}_${jakartaNow.date}`;
+      const [lockRows] = await conn.query(`SELECT GET_LOCK(?, 0) AS acquired`, [lockName]);
+      if (Number(lockRows?.[0]?.acquired || 0) !== 1) {
+        continue;
+      }
+
+      try {
+        const [existingRows] = await conn.query(
+          `SELECT status FROM tryout_nightly_process_log WHERE id_tryout = ? AND process_date = ? LIMIT 1`,
+          [tryout.id, jakartaNow.date]
+        );
+        if (existingRows.some((row) => row.status === "success")) {
+          continue;
+        }
+
+        await conn.query(
+          `
+          INSERT INTO tryout_nightly_process_log (id_tryout, process_date, status, started_at, finished_at, error_message)
+          VALUES (?, ?, 'running', NOW(), NULL, NULL)
+          ON DUPLICATE KEY UPDATE status = 'running', started_at = NOW(), finished_at = NULL, error_message = NULL
+          `,
+          [tryout.id, jakartaNow.date]
+        );
+
+        try {
+          await postLocalPengumuman(`/simpan-jawaban-user/${tryout.id}`, {});
+          await postLocalPengumuman("/process-tryout", {
+            idTryout: tryout.id,
+            jenis: "sbmptn",
+            forceReweight: true,
+            schedulerProcessDate: jakartaNow.date,
+          });
+          await conn.query(
+            `UPDATE tryout_nightly_process_log SET status = 'success', finished_at = NOW() WHERE id_tryout = ? AND process_date = ?`,
+            [tryout.id, jakartaNow.date]
+          );
+          console.log("[nightly-scheduler] success", { idTryout: tryout.id, processDate: jakartaNow.date });
+        } catch (error) {
+          await conn.query(
+            `UPDATE tryout_nightly_process_log SET status = 'failed', finished_at = NOW(), error_message = ? WHERE id_tryout = ? AND process_date = ?`,
+            [String(error.message || error).slice(0, 4000), tryout.id, jakartaNow.date]
+          );
+          console.error("[nightly-scheduler] failed", { idTryout: tryout.id, processDate: jakartaNow.date, message: error.message });
+        }
+      } finally {
+        await conn.query(`SELECT RELEASE_LOCK(?)`, [lockName]);
+      }
+    }
+  } catch (error) {
+    console.error("[nightly-scheduler] tick failed", { message: error.message });
+  } finally {
+    conn.release();
+    nightlySchedulerRunning = false;
+  }
 }
 
 async function deleteRedisKeysByPatterns(patterns = []) {
@@ -313,286 +466,6 @@ async function shouldSkipAutoWeighting(conn, idTryout) {
   };
 }
 
-async function ensureProvisionalResultTables(conn) {
-  await conn.query(`
-    CREATE TABLE IF NOT EXISTS tryout_provisional_snapshot (
-      id_tryout BIGINT NOT NULL,
-      participant_count INT NOT NULL DEFAULT 0,
-      snapshot_at DATETIME NOT NULL,
-      PRIMARY KEY (id_tryout)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-  `);
-  await conn.query(`
-    CREATE TABLE IF NOT EXISTS rank_tryout_provisional (
-      id_tryout BIGINT NOT NULL,
-      id_user BIGINT NOT NULL,
-      username VARCHAR(255) NOT NULL DEFAULT '',
-      peminatan VARCHAR(50) NOT NULL DEFAULT 'ipc',
-      total DECIMAL(12,4) NOT NULL DEFAULT 0,
-      instansi VARCHAR(255) NULL,
-      provinsi VARCHAR(100) NULL,
-      province_name VARCHAR(255) NULL,
-      rank_position INT NOT NULL DEFAULT 0,
-      subtests_json LONGTEXT NULL,
-      snapshot_at DATETIME NOT NULL,
-      PRIMARY KEY (id_tryout, id_user),
-      INDEX idx_provisional_rank (id_tryout, rank_position),
-      INDEX idx_provisional_province (id_tryout, provinsi, total)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-  `);
-}
-
-function provisionalQuestionKey(idMapel, noSoal) {
-  return `${Number(idMapel)}:${Number(noSoal)}`;
-}
-
-function parseLatestProvisionalAnswers(latestRows = []) {
-  const answersByUser = new Map();
-  latestRows.forEach((row) => {
-    let parsed = [];
-    try {
-      parsed = JSON.parse(row.jawaban_user_permapel || "[]");
-    } catch (error) {
-      return;
-    }
-    if (!Array.isArray(parsed)) return;
-
-    const idUser = Number(row.id_user);
-    if (!answersByUser.has(idUser)) {
-      answersByUser.set(idUser, {
-        idUser,
-        username: row.username || "",
-        peminatan: row.peminatan || "ipc",
-        instansi: row.instansi || null,
-        provinsi: row.provinsi === null || row.provinsi === undefined ? null : String(row.provinsi),
-        provinceName: row.province_name || null,
-        answers: [],
-      });
-    }
-    const user = answersByUser.get(idUser);
-    parsed.forEach((item) => {
-      const idMapel = Number(item?.id_mapel || row.id_mapel);
-      const noSoal = Number(item?.no_soal);
-      if (!Number.isFinite(idMapel) || !Number.isFinite(noSoal)) return;
-      user.answers.push({
-        idMapel,
-        noSoal,
-        status: String(item?.status || "").trim().toLowerCase(),
-      });
-    });
-  });
-  return answersByUser;
-}
-
-function buildProvisionalWeights(questionRows = [], answersByUser = new Map()) {
-  const questionStats = new Map();
-  const questionsByMapel = new Map();
-  questionRows.forEach((row) => {
-    const idMapel = Number(row.id_mapel);
-    const noSoal = Number(row.no_soal);
-    const key = provisionalQuestionKey(idMapel, noSoal);
-    questionStats.set(key, { attempts: 0, benar: 0, idMapel, noSoal });
-    if (!questionsByMapel.has(idMapel)) questionsByMapel.set(idMapel, []);
-    questionsByMapel.get(idMapel).push(key);
-  });
-
-  answersByUser.forEach((user) => {
-    user.answers.forEach((answer) => {
-      const stat = questionStats.get(provisionalQuestionKey(answer.idMapel, answer.noSoal));
-      if (!stat || !["benar", "salah"].includes(answer.status)) return;
-      stat.attempts += 1;
-      if (answer.status === "benar") stat.benar += 1;
-    });
-  });
-
-  const weights = new Map();
-  questionsByMapel.forEach((keys) => {
-    const rawValues = keys.map((key) => {
-      const stat = questionStats.get(key);
-      return stat.attempts <= 0 ? 0.5 : 1 - (stat.benar / stat.attempts);
-    });
-    const rawTotal = rawValues.reduce((sum, value) => sum + value, 0);
-    const avgRaw = rawValues.length > 0 ? rawTotal / rawValues.length : 0.5;
-    const targetTotal = Math.min(
-      AUTO_WEIGHT_MAX_TOTAL,
-      Math.max(AUTO_WEIGHT_MIN_TOTAL, AUTO_WEIGHT_TARGET_TOTAL + (0.5 * avgRaw))
-    );
-    keys.forEach((key, index) => {
-      const point = rawTotal > 0
-        ? (rawValues[index] / rawTotal) * targetTotal
-        : targetTotal / Math.max(keys.length, 1);
-      weights.set(key, point);
-    });
-  });
-  return weights;
-}
-
-function calculateProvisionalRanking(questionRows = [], answersByUser = new Map()) {
-  const weights = buildProvisionalWeights(questionRows, answersByUser);
-  const mapelMeta = new Map();
-  questionRows.forEach((row) => {
-    const idMapel = Number(row.id_mapel);
-    if (!mapelMeta.has(idMapel)) {
-      mapelMeta.set(idMapel, {
-        id: idMapel,
-        nama: row.nama_mapel || `Subtes ${idMapel}`,
-        no: Number(row.no_mapel || 0),
-      });
-    }
-  });
-
-  const ranking = [];
-  answersByUser.forEach((user) => {
-    if (!user.answers.length) return;
-    const subtestScores = new Map();
-    user.answers.forEach((answer) => {
-      if (!subtestScores.has(answer.idMapel)) subtestScores.set(answer.idMapel, 0);
-      if (answer.status === "benar") {
-        const point = weights.get(provisionalQuestionKey(answer.idMapel, answer.noSoal)) || 0;
-        subtestScores.set(answer.idMapel, subtestScores.get(answer.idMapel) + (point * 100));
-      }
-    });
-    const subtests = Array.from(subtestScores.entries())
-      .map(([idMapel, nilai]) => ({ ...(mapelMeta.get(idMapel) || { id: idMapel, nama: `Subtes ${idMapel}`, no: 0 }), nilai }))
-      .sort((a, b) => a.no - b.no || a.id - b.id);
-    const scoreSum = subtests.reduce((sum, item) => sum + Number(item.nilai || 0), 0);
-    ranking.push({ ...user, total: scoreSum / 7, subtests });
-  });
-
-  ranking.sort((a, b) => b.total - a.total || a.idUser - b.idUser);
-  ranking.forEach((item, index) => { item.rank = index + 1; });
-  return ranking;
-}
-
-async function rebuildProvisionalSnapshot(conn, idTryout) {
-  const [latestRows, questionRows] = await Promise.all([
-    conn.query(
-      `
-      SELECT
-        v.id_user,
-        v.id_mapel,
-        v.peminatan,
-        v.jawaban_user_permapel,
-        u.username,
-        ud.instansi,
-        ud.provinsi,
-        p.province_name
-      FROM jawaban_user_tryout_v2 v
-      JOIN (
-        SELECT MAX(v2.id) AS max_id
-        FROM jawaban_user_tryout_v2 v2
-        JOIN (
-          SELECT DISTINCT id_user
-          FROM status_tryout
-          WHERE id_tryout = ? AND LOWER(COALESCE(status, '')) = 'done'
-        ) finished ON finished.id_user = v2.id_user
-        WHERE v2.id_tryout = ?
-        GROUP BY v2.id_user, v2.id_tryout, v2.id_mapel
-      ) latest ON latest.max_id = v.id
-      JOIN users u ON u.id = v.id_user
-      LEFT JOIN userdata ud ON ud.id_user = v.id_user
-      LEFT JOIN province p ON p.id = ud.provinsi
-      WHERE v.id_tryout = ?
-      `,
-      [idTryout, idTryout, idTryout]
-    ).then(([rows]) => rows),
-    conn.query(
-      `
-      SELECT st.id_mapel, st.no_soal, mp.nama AS nama_mapel, mp.no AS no_mapel
-      FROM soal_tryout st
-      JOIN mata_pelajaran mp ON mp.id = st.id_mapel
-      WHERE st.id_tryout = ?
-      ORDER BY mp.no ASC, st.no_soal ASC
-      `,
-      [idTryout]
-    ).then(([rows]) => rows),
-  ]);
-
-  const answersByUser = parseLatestProvisionalAnswers(latestRows);
-  const ranking = calculateProvisionalRanking(questionRows, answersByUser);
-  const snapshotAt = new Date();
-
-  await conn.beginTransaction();
-  try {
-    await conn.query(`DELETE FROM rank_tryout_provisional WHERE id_tryout = ?`, [idTryout]);
-    if (ranking.length) {
-      const values = ranking.map((item) => [
-        Number(idTryout), item.idUser, item.username, item.peminatan || "ipc", item.total,
-        item.instansi, item.provinsi, item.provinceName, item.rank,
-        JSON.stringify(item.subtests), snapshotAt,
-      ]);
-      await conn.query(
-        `
-        INSERT INTO rank_tryout_provisional
-          (id_tryout, id_user, username, peminatan, total, instansi, provinsi, province_name, rank_position, subtests_json, snapshot_at)
-        VALUES ?
-        `,
-        [values]
-      );
-    }
-    await conn.query(
-      `
-      INSERT INTO tryout_provisional_snapshot (id_tryout, participant_count, snapshot_at)
-      VALUES (?, ?, ?)
-      ON DUPLICATE KEY UPDATE participant_count = VALUES(participant_count), snapshot_at = VALUES(snapshot_at)
-      `,
-      [idTryout, ranking.length, snapshotAt]
-    );
-    await conn.commit();
-  } catch (error) {
-    await conn.rollback();
-    throw error;
-  }
-  return { ranking, snapshotAt };
-}
-
-async function readProvisionalResult(conn, idTryout, idUser) {
-  const [[snapshotRows], [leaderboardRows]] = await Promise.all([
-    conn.query(
-      `SELECT participant_count, snapshot_at FROM tryout_provisional_snapshot WHERE id_tryout = ? LIMIT 1`,
-      [idTryout]
-    ),
-    conn.query(
-      `
-      SELECT id_user, username, peminatan, total, instansi, provinsi, province_name,
-             rank_position AS \`rank\`, subtests_json, snapshot_at
-      FROM rank_tryout_provisional
-      WHERE id_tryout = ?
-      ORDER BY rank_position ASC
-      `,
-      [idTryout]
-    ),
-  ]);
-  const snapshot = snapshotRows[0] || null;
-  const leaderboard = leaderboardRows.map((row) => ({
-    id_user: Number(row.id_user),
-    username: row.username,
-    peminatan: row.peminatan,
-    total: Number(row.total || 0),
-    instansi: row.instansi,
-    provinsi: row.provinsi,
-    province_name: row.province_name,
-    rank: Number(row.rank || 0),
-  }));
-  const rawUser = leaderboardRows.find((row) => Number(row.id_user) === Number(idUser));
-  let subtests = [];
-  if (rawUser?.subtests_json) {
-    try { subtests = JSON.parse(rawUser.subtests_json); } catch (error) { subtests = []; }
-  }
-  return {
-    snapshot,
-    leaderboard,
-    user: rawUser ? {
-      id_user: Number(rawUser.id_user),
-      username: rawUser.username,
-      peminatan: rawUser.peminatan,
-      total: Number(rawUser.total || 0),
-      rank: Number(rawUser.rank || 0),
-      subtests,
-    } : null,
-  };
-}
-
 app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
   const startTime = Date.now();
   const conn = await pool.getConnection();
@@ -758,7 +631,7 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
 
 // 🚀 API untuk generate ranking & simpan ke rank_tryout_2025
 app.post("/process-tryout", async (req, res) => {
-  const { idTryout, jenis, tipe_tryout } = req.body;
+  const { idTryout, jenis, tipe_tryout, forceReweight = false } = req.body;
   const conn = await pool.getConnection();
   const processStart = Date.now();
   const normalizedJenis = await resolveJenisTryout(conn, idTryout, jenis || tipe_tryout);
@@ -804,11 +677,12 @@ app.post("/process-tryout", async (req, res) => {
         skipped: true,
         reason: "not_required_for_simak_ui",
       };
-    } else if (!weightGuard.skip) {
+    } else if (forceReweight || !weightGuard.skip) {
       const autoWeightResult = await autoSetBobotSoalByTryout(conn, idTryout);
       weightSummary = {
         ...weightSummary,
         ...autoWeightResult,
+        reason: forceReweight ? "nightly_reweight" : null,
       };
     } else {
       weightSummary = {
@@ -1194,126 +1068,79 @@ app.post("/process-tryout", async (req, res) => {
   }
 });
 
-app.post("/provisional-results", async (req, res) => {
-  const { idTryout, idUser } = req.body;
-  if (!idTryout || !idUser) {
-    return res.status(400).json({ success: false, message: "idTryout dan idUser wajib diisi" });
+app.post("/nightly-result-status", async (req, res) => {
+  const { idTryout } = req.body;
+  if (!idTryout) {
+    return res.status(400).json({ success: false, message: "idTryout wajib diisi" });
   }
 
   const conn = await pool.getConnection();
-  const lockName = `provisional_tryout_${Number(idTryout)}`;
-  let lockAcquired = false;
   try {
-    await ensureProvisionalResultTables(conn);
-
-    const [[tryoutRows], [accessRows], [statusRows]] = await Promise.all([
-      conn.query(`SELECT jenis, tipe_tryout FROM tryout WHERE id = ? LIMIT 1`, [idTryout]),
-      conn.query(
-        `
-        SELECT (
-          EXISTS(
-            SELECT 1
-            FROM pendaftaran_tryout_user ptu
-            WHERE ptu.id_tryout = ? AND ptu.id_user = ?
-              AND LOWER(COALESCE(ptu.jenis_pendaftaran, '')) IN ('siappoin', 'berbayar')
-              AND LOWER(COALESCE(ptu.status_pendaftaran, 'verified')) IN ('verified', 'settlement', 'capture', 'terdaftar')
-          )
-          OR EXISTS(
-            SELECT 1
-            FROM siapbimbel sb
-            WHERE sb.id_user = ? AND sb.end_date >= NOW()
-              AND LOWER(COALESCE(sb.jenis, '')) NOT IN ('siapbelajar_mini_kedinasan', 'siapbelajar_mini_mandiri')
-          )
-        ) AS allowed
-        `,
-        [idTryout, idUser, idUser]
-      ),
-      conn.query(
-        `
-        SELECT 1 AS finished
-        FROM status_tryout
-        WHERE id_tryout = ? AND id_user = ? AND LOWER(COALESCE(status, '')) = 'done'
-        LIMIT 1
-        `,
-        [idTryout, idUser]
-      ),
-    ]);
+    await ensureNightlySchedulerTable(conn);
+    const [tryoutRows] = await conn.query(
+      `
+      SELECT
+        id,
+        jenis,
+        tipe_tryout,
+        start_time,
+        end_time,
+        DATE_FORMAT(DATE(start_time), '%Y-%m-%d') AS first_process_date,
+        DATE_FORMAT(DATE_ADD(DATE(end_time), INTERVAL 1 DAY), '%Y-%m-%d') AS final_process_date
+      FROM tryout
+      WHERE id = ?
+      LIMIT 1
+      `,
+      [idTryout]
+    );
 
     if (!tryoutRows.length) {
       return res.status(404).json({ success: false, code: "TRYOUT_NOT_FOUND", message: "Tryout tidak ditemukan" });
     }
-    const jenisCandidates = [tryoutRows[0].jenis, tryoutRows[0].tipe_tryout].map(normalizeJenis);
-    if (!jenisCandidates.some((jenis) => jenis === "sbmptn" || jenis === "snbt")) {
-      return res.status(400).json({
-        success: false,
-        code: "UNSUPPORTED_TRYOUT_TYPE",
-        message: "Hasil sementara saat ini hanya tersedia untuk tryout SNBT",
-      });
-    }
-    if (!Number(accessRows?.[0]?.allowed || 0)) {
-      return res.status(403).json({
-        success: false,
-        code: "PREMIUM_REQUIRED",
-        message: "Hasil sementara hanya dapat dibuka oleh user Premium",
-      });
-    }
-    if (!statusRows.length) {
-      return res.status(409).json({
-        success: false,
-        code: "TRYOUT_NOT_FINISHED",
-        message: "Selesaikan tryout terlebih dahulu untuk melihat hasil sementara",
-      });
-    }
 
-    let result = await readProvisionalResult(conn, idTryout, idUser);
-    const snapshotTime = result.snapshot?.snapshot_at
-      ? new Date(result.snapshot.snapshot_at).getTime()
-      : 0;
-    const snapshotIsFresh = snapshotTime > 0 && Date.now() - snapshotTime < PROVISIONAL_SNAPSHOT_TTL_MS;
+    const tryout = tryoutRows[0];
+    const supported = [tryout.jenis, tryout.tipe_tryout]
+      .map(normalizeJenis)
+      .some((jenis) => jenis === "sbmptn" || jenis === "snbt");
 
-    if (!snapshotIsFresh) {
-      const [[lockRows]] = await conn.query(`SELECT GET_LOCK(?, 0) AS acquired`, [lockName]);
-      lockAcquired = Number(lockRows?.[0]?.acquired || 0) === 1;
-      if (lockAcquired) {
-        await rebuildProvisionalSnapshot(conn, idTryout);
-        result = await readProvisionalResult(conn, idTryout, idUser);
-      } else if (!result.snapshot) {
-        return res.status(202).json({
-          success: true,
-          status: "processing",
-          provisional: true,
-          message: "Hasil sementara sedang dihitung",
-        });
-      }
-    }
-
-    if (!result.user) {
-      return res.status(202).json({
+    if (!supported) {
+      return res.json({
         success: true,
-        status: "processing",
-        provisional: true,
-        participantCount: Number(result.snapshot?.participant_count || 0),
-        asOf: result.snapshot?.snapshot_at || null,
-        message: "Jawaban selesai ditemukan dan hasil sementara sedang disiapkan",
+        supported: false,
+        ready: false,
+        message: "Status proses malam hanya berlaku untuk tryout SNBT",
       });
     }
+
+    const [successRows] = await conn.query(
+      `
+      SELECT process_date, finished_at
+      FROM tryout_nightly_process_log
+      WHERE id_tryout = ? AND status = 'success'
+      ORDER BY process_date DESC, finished_at DESC
+      LIMIT 1
+      `,
+      [idTryout]
+    );
+    const latestSuccess = successRows[0] || null;
 
     return res.json({
       success: true,
-      status: "ready",
-      provisional: true,
-      participantCount: Number(result.snapshot?.participant_count || result.leaderboard.length),
-      asOf: result.snapshot?.snapshot_at || result.user.snapshot_at || null,
-      user: result.user,
-      leaderboard: result.leaderboard,
+      supported: true,
+      ready: Boolean(latestSuccess),
+      firstScheduledAt: `${tryout.first_process_date} 23:59:00`,
+      finalScheduledAt: `${tryout.final_process_date} 23:59:00`,
+      lastProcessedAt: latestSuccess?.finished_at || null,
+      lastProcessDate: latestSuccess?.process_date || null,
+      timeZone: NIGHTLY_SCHEDULER_TIME_ZONE,
+      message: latestSuccess
+        ? "Hasil sementara sudah tersedia"
+        : "Penilaian IRT masih diproses dan akan tersedia setelah proses malam pertama berhasil",
     });
   } catch (error) {
-    console.error("[provisional-results] failed", { idTryout, idUser, message: error.message });
+    console.error("[nightly-result-status] failed", { idTryout, message: error.message });
     return res.status(500).json({ success: false, error: error.message });
   } finally {
-    if (lockAcquired) {
-      try { await conn.query(`SELECT RELEASE_LOCK(?)`, [lockName]); } catch (error) {}
-    }
     conn.release();
   }
 });
@@ -1925,6 +1752,15 @@ app.get("/ranking/:idTryout", async (req, res) => {
 const server = app.listen(2234, () => {
   console.log("Server pengumuman running on http://localhost:2234");
 });
+
+const nightlySchedulerTimer = setInterval(
+  runNightlyTryoutScheduler,
+  NIGHTLY_SCHEDULER_INTERVAL_MS
+);
+nightlySchedulerTimer.unref();
+
+const initialNightlySchedulerTimer = setTimeout(runNightlyTryoutScheduler, 5000);
+initialNightlySchedulerTimer.unref();
 
 server.timeout = 600000; // untuk request
 server.keepAliveTimeout = 620000; // jaga supaya koneksi gak putus duluan
