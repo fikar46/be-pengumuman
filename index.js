@@ -666,7 +666,7 @@ app.post("/simpan-jawaban-user/:id_tryout", async (req, res) => {
 
 // 🚀 API untuk generate ranking & simpan ke rank_tryout_2025
 app.post("/process-tryout", async (req, res) => {
-  const { idTryout, jenis, tipe_tryout, forceReweight = false } = req.body;
+  const { idTryout, jenis, tipe_tryout, forceReweight = false, schedulerProcessDate } = req.body;
   const conn = await pool.getConnection();
   const processStart = Date.now();
   const normalizedJenis = await resolveJenisTryout(conn, idTryout, jenis || tipe_tryout);
@@ -1074,6 +1074,47 @@ app.post("/process-tryout", async (req, res) => {
     stepStart = Date.now();
     await conn.commit();
     mark("commit_ms", stepStart);
+
+    // Proses manual admin juga dianggap sebagai satu proses hasil untuk
+    // membuka hasil sementara Premium, tanpa mengubah flow admin yang ada.
+    if (["sbmptn", "snbt"].includes(normalizedJenis)) {
+      await ensureNightlySchedulerTable(conn);
+      const [scheduleRows] = await conn.query(
+        `
+        SELECT
+          DATE_FORMAT(DATE(start_time), '%Y-%m-%d') AS first_process_date,
+          DATE_FORMAT(DATE_ADD(DATE(end_time), INTERVAL 1 DAY), '%Y-%m-%d') AS final_process_date
+        FROM tryout
+        WHERE id = ?
+        LIMIT 1
+        `,
+        [idTryout]
+      );
+      const schedule = scheduleRows[0] || {};
+      const [successfulProcessRows] = await conn.query(
+        `SELECT DATE_FORMAT(process_date, '%Y-%m-%d') AS process_date
+         FROM tryout_nightly_process_log
+         WHERE id_tryout = ? AND status = 'success'
+         ORDER BY process_date ASC
+         LIMIT 1`,
+        [idTryout]
+      );
+      const processDate = schedulerProcessDate
+        || (successfulProcessRows.length > 0 ? getJakartaDateParts().date : null)
+        || schedule.first_process_date
+        || getJakartaDateParts().date;
+      if (!schedule.final_process_date || processDate <= schedule.final_process_date) {
+        await conn.query(
+          `
+          INSERT INTO tryout_nightly_process_log
+            (id_tryout, process_date, status, started_at, finished_at, error_message)
+          VALUES (?, ?, 'success', NOW(), NOW(), NULL)
+          ON DUPLICATE KEY UPDATE status = 'success', finished_at = NOW(), error_message = NULL
+          `,
+          [idTryout, processDate]
+        );
+      }
+    }
 
     stepStart = Date.now();
     await redis.flushdb("ASYNC");
