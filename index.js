@@ -139,6 +139,12 @@ function getJakartaDateParts(date = new Date()) {
   };
 }
 
+function addCalendarDays(dateValue, days) {
+  const date = new Date(`${dateValue}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
 async function ensureNightlySchedulerTable(conn) {
   await conn.query(`
     CREATE TABLE IF NOT EXISTS tryout_nightly_process_log (
@@ -193,9 +199,10 @@ function postLocalPengumuman(path, payload = {}, timeoutMs = 15 * 60 * 1000) {
 let nightlySchedulerRunning = false;
 async function runNightlyTryoutScheduler() {
   const jakartaNow = getJakartaDateParts();
-  if (jakartaNow.hour !== 23 || jakartaNow.minute !== 59 || nightlySchedulerRunning) {
+  if (nightlySchedulerRunning) {
     return;
   }
+  const isNightlyWindow = jakartaNow.hour === 23 && jakartaNow.minute === 59;
 
   nightlySchedulerRunning = true;
   const conn = await pool.getConnection();
@@ -203,7 +210,9 @@ async function runNightlyTryoutScheduler() {
     await ensureNightlySchedulerTable(conn);
     const [tryoutRows] = await conn.query(
       `
-      SELECT id
+      SELECT id,
+        DATE_FORMAT(DATE(start_time), '%Y-%m-%d') AS first_process_date,
+        DATE_FORMAT(DATE_ADD(DATE(end_time), INTERVAL 1 DAY), '%Y-%m-%d') AS final_process_date
       FROM tryout
       WHERE (LOWER(COALESCE(jenis, '')) IN ('sbmptn', 'snbt')
              OR LOWER(COALESCE(tipe_tryout, '')) IN ('sbmptn', 'snbt'))
@@ -214,7 +223,33 @@ async function runNightlyTryoutScheduler() {
     );
 
     for (const tryout of tryoutRows) {
-      const lockName = `nightly_tryout_${tryout.id}_${jakartaNow.date}`;
+      const firstProcessDate = tryout.first_process_date;
+      const finalProcessDate = tryout.final_process_date;
+      if (!firstProcessDate || !finalProcessDate || firstProcessDate > jakartaNow.date) {
+        continue;
+      }
+      const lastDueDate = finalProcessDate < jakartaNow.date ? finalProcessDate : jakartaNow.date;
+      if (lastDueDate < firstProcessDate) {
+        continue;
+      }
+
+      const [processedRows] = await conn.query(
+        `SELECT DATE_FORMAT(process_date, '%Y-%m-%d') AS process_date, status FROM tryout_nightly_process_log
+         WHERE id_tryout = ? AND process_date BETWEEN ? AND ?`,
+        [tryout.id, firstProcessDate, lastDueDate]
+      );
+      const processedSuccessDates = new Set(
+        processedRows.filter((row) => row.status === "success").map((row) => String(row.process_date).slice(0, 10))
+      );
+      let processDate = firstProcessDate;
+      while (processDate <= lastDueDate && processedSuccessDates.has(processDate)) {
+        processDate = addCalendarDays(processDate, 1);
+      }
+      if (processDate > lastDueDate || (processDate === jakartaNow.date && !isNightlyWindow)) {
+        continue;
+      }
+
+      const lockName = `nightly_tryout_${tryout.id}_${processDate}`;
       const [lockRows] = await conn.query(`SELECT GET_LOCK(?, 0) AS acquired`, [lockName]);
       if (Number(lockRows?.[0]?.acquired || 0) !== 1) {
         continue;
@@ -223,7 +258,7 @@ async function runNightlyTryoutScheduler() {
       try {
         const [existingRows] = await conn.query(
           `SELECT status FROM tryout_nightly_process_log WHERE id_tryout = ? AND process_date = ? LIMIT 1`,
-          [tryout.id, jakartaNow.date]
+          [tryout.id, processDate]
         );
         if (existingRows.some((row) => row.status === "success")) {
           continue;
@@ -235,7 +270,7 @@ async function runNightlyTryoutScheduler() {
           VALUES (?, ?, 'running', NOW(), NULL, NULL)
           ON DUPLICATE KEY UPDATE status = 'running', started_at = NOW(), finished_at = NULL, error_message = NULL
           `,
-          [tryout.id, jakartaNow.date]
+          [tryout.id, processDate]
         );
 
         try {
@@ -244,19 +279,19 @@ async function runNightlyTryoutScheduler() {
             idTryout: tryout.id,
             jenis: "sbmptn",
             forceReweight: true,
-            schedulerProcessDate: jakartaNow.date,
+            schedulerProcessDate: processDate,
           });
           await conn.query(
             `UPDATE tryout_nightly_process_log SET status = 'success', finished_at = NOW() WHERE id_tryout = ? AND process_date = ?`,
-            [tryout.id, jakartaNow.date]
+            [tryout.id, processDate]
           );
-          console.log("[nightly-scheduler] success", { idTryout: tryout.id, processDate: jakartaNow.date });
+          console.log("[nightly-scheduler] success", { idTryout: tryout.id, processDate, catchUp: processDate !== jakartaNow.date });
         } catch (error) {
           await conn.query(
             `UPDATE tryout_nightly_process_log SET status = 'failed', finished_at = NOW(), error_message = ? WHERE id_tryout = ? AND process_date = ?`,
-            [String(error.message || error).slice(0, 4000), tryout.id, jakartaNow.date]
+            [String(error.message || error).slice(0, 4000), tryout.id, processDate]
           );
-          console.error("[nightly-scheduler] failed", { idTryout: tryout.id, processDate: jakartaNow.date, message: error.message });
+          console.error("[nightly-scheduler] failed", { idTryout: tryout.id, processDate, message: error.message });
         }
       } finally {
         await conn.query(`SELECT RELEASE_LOCK(?)`, [lockName]);
