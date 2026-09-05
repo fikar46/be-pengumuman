@@ -2,6 +2,11 @@ import express from "express";
 import mysql from "mysql2/promise";
 import Redis from "ioredis";
 import http from "http";
+import {
+  buildTkaSubjectResult,
+  hasTkaIstimewaPredicate,
+  toTkaScaledScoreFromTotal,
+} from "./tkaScoring.js";
 
 const app = express();
 app.use((req, res, next) => {
@@ -533,7 +538,8 @@ async function shouldSkipAutoWeighting(conn, idTryout) {
     `
     SELECT
       COUNT(*) AS total_soal,
-      SUM(CASE WHEN point IS NOT NULL THEN 1 ELSE 0 END) AS soal_berbobot
+      SUM(CASE WHEN point IS NOT NULL THEN 1 ELSE 0 END) AS soal_berbobot,
+      SUM(COALESCE(point, 0)) AS total_point
     FROM soal_tryout
     WHERE id_tryout = ?
   `,
@@ -546,11 +552,13 @@ async function shouldSkipAutoWeighting(conn, idTryout) {
 
   const totalSoal = Number(rows[0].total_soal || 0);
   const soalBerbobot = Number(rows[0].soal_berbobot || 0);
+  const totalPoint = Number(rows[0].total_point || 0);
 
   return {
-    skip: totalSoal > 0 && soalBerbobot === totalSoal,
+    skip: totalSoal > 0 && soalBerbobot === totalSoal && totalPoint > 0,
     total_soal: totalSoal,
     soal_berbobot: soalBerbobot,
+    total_point: totalPoint,
   };
 }
 
@@ -1015,6 +1023,75 @@ app.post("/process-tryout", async (req, res) => {
         `,
         [idTryout]
       );
+    } else if (normalizedJenis === "tka") {
+      await conn.query(
+        `
+        INSERT INTO rank_tryout_2025
+        (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year)
+        SELECT
+          r.id_user,
+          r.username,
+          r.peminatan,
+          r.total,
+          ud.instansi,
+          ud.provinsi,
+          r.rnk,
+          ?,
+          2026
+        FROM (
+          SELECT
+            n.id_user,
+            n.username,
+            n.peminatan,
+            n.total,
+            ROW_NUMBER() OVER (ORDER BY n.total DESC) AS rnk
+          FROM (
+            SELECT
+              scored.id_user,
+              scored.username,
+              COALESCE(MAX(NULLIF(scored.peminatan, '')), 'ipc') AS peminatan,
+              LEAST(500, SUM(scored.weighted_percent)) AS total
+            FROM (
+              SELECT
+                jut.id_user,
+                u.username,
+                COALESCE(MAX(NULLIF(jut.peminatan, '')), 'ipc') AS peminatan,
+                100 * COALESCE(
+                  SUM(
+                    CASE
+                      WHEN jut.jawaban = st.kunci OR jut.status = 'benar'
+                        THEN COALESCE(st.point, 0)
+                      ELSE 0
+                    END
+                  ) / NULLIF(MAX(mt.total_point), 0),
+                  SUM(CASE WHEN jut.jawaban = st.kunci OR jut.status = 'benar' THEN 1 ELSE 0 END)
+                    / NULLIF(MAX(mt.total_soal), 0),
+                  0
+                ) AS weighted_percent
+              FROM tmp_latest_jawaban jut
+              JOIN soal_tryout st
+                ON st.no_soal = jut.no_soal
+               AND st.id_mapel = jut.id_mapel
+               AND st.id_tryout = jut.id_tryout
+              JOIN (
+                SELECT
+                  id_mapel,
+                  SUM(COALESCE(point, 0)) AS total_point,
+                  COUNT(DISTINCT no_soal) AS total_soal
+                FROM soal_tryout
+                WHERE id_tryout = ?
+                GROUP BY id_mapel
+              ) mt ON mt.id_mapel = jut.id_mapel
+              JOIN users u ON u.id = jut.id_user
+              GROUP BY jut.id_user, u.username, jut.id_mapel
+            ) scored
+            GROUP BY scored.id_user, scored.username
+          ) n
+        ) r
+        LEFT JOIN userdata ud ON ud.id_user = r.id_user;
+        `,
+        [idTryout, idTryout]
+      );
     } else {
       await conn.query(
         `
@@ -1192,6 +1269,13 @@ app.post("/process-tryout", async (req, res) => {
         reason: weightSummary.reason,
         guard: weightSummary.guard,
       },
+      tka_scoring: normalizedJenis === "tka" ? {
+        skala_nilai: "200-800",
+        metode_nilai: "point-weighted-200-800",
+        kategori: ["Kurang", "Memadai", "Baik"],
+        kategori_estimasi: true,
+        predikat_istimewa_minimum_setiap_mata_uji: 725,
+      } : null,
       timings,
     });
   } catch (err) {
@@ -1669,6 +1753,55 @@ app.post("/process-tryout-user", async (req, res) => {
       return res.status(200).json(userNotAttemptedResponse());
     }
 
+    let tkaSubjects = [];
+    if (normalizedJenis === "tka") {
+      const [tkaSubjectRows] = await conn.query(
+        `
+        SELECT
+          st.id_mapel,
+          mp.nama,
+          COUNT(DISTINCT st.no_soal) AS jumlah_soal,
+          SUM(CASE WHEN ju.jawaban = st.kunci OR ju.status = 'benar' THEN 1 ELSE 0 END) AS benar,
+          SUM(
+            CASE
+              WHEN ju.jawaban = st.kunci OR ju.status = 'benar' THEN COALESCE(st.point, 0)
+              ELSE 0
+            END
+          ) AS earned_point,
+          SUM(COALESCE(st.point, 0)) AS total_point,
+          (
+            SUM(CASE WHEN ju.jawaban = st.kunci OR ju.status = 'benar' THEN 1 ELSE 0 END)
+            / NULLIF(COUNT(DISTINCT st.no_soal), 0)
+          ) * 100 AS legacy_percent
+        FROM soal_tryout st
+        JOIN mata_pelajaran mp ON mp.id = st.id_mapel
+        LEFT JOIN (
+          SELECT j1.*
+          FROM jawaban_user_tryout_pembahasan j1
+          JOIN (
+            SELECT MAX(id) AS max_id
+            FROM jawaban_user_tryout_pembahasan
+            WHERE id_tryout = ? AND id_user = ?
+            GROUP BY id_user, id_tryout, id_mapel, no_soal
+          ) latest ON latest.max_id = j1.id
+        ) ju
+          ON ju.id_tryout = st.id_tryout
+         AND ju.id_mapel = st.id_mapel
+         AND ju.no_soal = st.no_soal
+        WHERE st.id_tryout = ?
+          AND st.id_mapel IN (
+            SELECT DISTINCT id_mapel
+            FROM jawaban_user_tryout_v2
+            WHERE id_tryout = ? AND id_user = ?
+          )
+        GROUP BY st.id_mapel, mp.nama
+        ORDER BY st.id_mapel ASC
+        `,
+        [idTryout, idUser, idTryout, idTryout, idUser]
+      );
+      tkaSubjects = tkaSubjectRows.map(buildTkaSubjectResult);
+    }
+
     const rawTotal = Number(scoreRows[0].raw_total || 0);
     const userPeminatan = scoreRows[0].peminatan || ((isKedinasan || isSimakUi || isUmUns) ? "ipc" : "Saintek");
     let finalTotal = (isUmUgm || isSimakUi)
@@ -1679,6 +1812,10 @@ app.post("/process-tryout-user", async (req, res) => {
     if (isSimakUi) {
       finalTotal = Math.max(0, Math.min(1000, finalTotal));
     } else if (normalizedJenis === "tka") {
+      finalTotal = tkaSubjects.reduce(
+        (total, subject) => total + ((Number(subject.nilai || 200) - 200) / 6),
+        0
+      );
       finalTotal = Math.max(0, Math.min(500, finalTotal));
     }
 
@@ -1773,6 +1910,20 @@ app.post("/process-tryout-user", async (req, res) => {
         idTryout: Number(idTryout),
         idUser: Number(idUser),
         total: finalTotal,
+        nilai_tka: normalizedJenis === "tka"
+          ? toTkaScaledScoreFromTotal(finalTotal, 5)
+          : null,
+        skala_nilai: normalizedJenis === "tka" ? "200-800" : null,
+        metode_nilai: normalizedJenis === "tka"
+          ? (tkaSubjects.length > 0 && tkaSubjects.every((subject) => subject.metode_nilai === "point-weighted-200-800")
+            ? "point-weighted-200-800"
+            : "fallback-linear")
+          : null,
+        kategori_per_mata_uji: normalizedJenis === "tka" ? tkaSubjects : [],
+        kategori_estimasi: normalizedJenis === "tka",
+        predikat_istimewa: normalizedJenis === "tka"
+          ? hasTkaIstimewaPredicate(tkaSubjects, 5)
+          : false,
         rank: userRank,
         deleted_cache_keys: cacheClear.deleted,
       },
@@ -1865,10 +2016,12 @@ app.get("/ranking/:idTryout", async (req, res) => {
           COALESCE(r.instansi, '-') AS instansi,
           COALESCE(r.provinsi, 0) AS provinsi,
           r.rank,
+          t.tipe_tryout,
           p.province_name,
           u.image
       FROM rank_tryout_2025 r
       JOIN users u ON u.id = r.id_user
+      JOIN tryout t ON t.id = r.id_tryout
       LEFT JOIN province p ON p.id = r.provinsi
       WHERE r.id_tryout = ?
       ORDER BY r.total DESC
@@ -1876,7 +2029,17 @@ app.get("/ranking/:idTryout", async (req, res) => {
       [idTryout]
     );
 
-    res.json({ success: true, data: rows });
+    const data = rows.map((row) => {
+      if (normalizeJenis(row.tipe_tryout) !== "tka") return row;
+      return {
+        ...row,
+        nilai_tka: toTkaScaledScoreFromTotal(row.total, 5),
+        skala_nilai: "200-800",
+        metode_nilai: "aggregate-compatible-200-800",
+      };
+    });
+
+    res.json({ success: true, data });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: err.message });
