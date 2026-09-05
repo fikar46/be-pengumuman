@@ -50,6 +50,19 @@ export function buildTkaSubjectResult(row = {}) {
   };
 }
 
+export function calculateTkaAggregateScore(subjects = [], expectedSubjectCount = 5) {
+  const expected = Math.max(1, Number(expectedSubjectCount) || 5);
+  const scores = (Array.isArray(subjects) ? subjects : [])
+    .map((subject) => Number(subject?.nilai))
+    .filter(Number.isFinite)
+    .map((score) => clamp(score, TKA_MIN_SCORE, TKA_MAX_SCORE));
+  const divisor = Math.max(expected, scores.length);
+  const missingCount = Math.max(0, expected - scores.length);
+  const total = scores.reduce((sum, score) => sum + score, 0)
+    + (missingCount * TKA_MIN_SCORE);
+  return Number((total / divisor).toFixed(2));
+}
+
 export function hasTkaIstimewaPredicate(subjects = [], expectedSubjectCount = 5) {
   return Array.isArray(subjects)
     && subjects.length >= expectedSubjectCount

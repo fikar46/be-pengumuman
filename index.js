@@ -4,6 +4,7 @@ import Redis from "ioredis";
 import http from "http";
 import {
   buildTkaSubjectResult,
+  calculateTkaAggregateScore,
   hasTkaIstimewaPredicate,
   toTkaScaledScoreFromTotal,
 } from "./tkaScoring.js";
@@ -1050,9 +1051,15 @@ app.post("/process-tryout", async (req, res) => {
               scored.id_user,
               scored.username,
               COALESCE(MAX(NULLIF(scored.peminatan, '')), 'ipc') AS peminatan,
-              /* Simpan agregat ranking pada skala IRT yang sama dengan
-                 pengumuman: rata-rata skor tiap mata uji (200-800). */
-              GREATEST(200, LEAST(800, AVG(200 + (scored.weighted_percent * 6)))) AS total
+              /* TKA terdiri dari minimal lima mata uji. Mata uji yang belum
+                 dikerjakan tetap mengambil skor dasar 200 agar satu mata uji
+                 penuh tidak menghasilkan agregat 800. */
+              GREATEST(200, LEAST(800,
+                (
+                  SUM(200 + (scored.weighted_percent * 6))
+                  + (GREATEST(0, 5 - COUNT(*)) * 200)
+                ) / GREATEST(5, COUNT(*))
+              )) AS total
             FROM (
               SELECT
                 jut.id_user,
@@ -1088,7 +1095,6 @@ app.post("/process-tryout", async (req, res) => {
               GROUP BY jut.id_user, u.username, jut.id_mapel
             ) scored
             GROUP BY scored.id_user, scored.username
-            HAVING COUNT(*) >= 5
           ) n
         ) r
         LEFT JOIN userdata ud ON ud.id_user = r.id_user;
@@ -1815,11 +1821,7 @@ app.post("/process-tryout-user", async (req, res) => {
     if (isSimakUi) {
       finalTotal = Math.max(0, Math.min(1000, finalTotal));
     } else if (normalizedJenis === "tka") {
-      const subjectScores = tkaSubjects.map((subject) => Number(subject.nilai)).filter(Number.isFinite);
-      const averageScore = subjectScores.length
-        ? subjectScores.reduce((total, score) => total + score, 0) / subjectScores.length
-        : 200;
-      finalTotal = Math.max(200, Math.min(800, Number(averageScore.toFixed(2))));
+      finalTotal = calculateTkaAggregateScore(tkaSubjects, 5);
     }
 
     // 7) Upsert ranking user ke rank_tryout_2025

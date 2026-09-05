@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildTkaSubjectResult,
+  calculateTkaAggregateScore,
   getEstimatedTkaCategory,
   hasTkaIstimewaPredicate,
   toTkaScaledScore,
@@ -46,4 +47,15 @@ test("predikat Istimewa mensyaratkan semua lima mata uji minimal 725", () => {
   assert.equal(hasTkaIstimewaPredicate(complete), true);
   assert.equal(hasTkaIstimewaPredicate([...complete.slice(0, 4), { nilai: 724.99 }]), false);
   assert.equal(hasTkaIstimewaPredicate(complete.slice(0, 4)), false);
+});
+
+test("agregat TKA selalu memperhitungkan minimal lima mata uji", () => {
+  assert.equal(calculateTkaAggregateScore([{ nilai: 800 }]), 320);
+  assert.equal(calculateTkaAggregateScore([
+    { nilai: 500 },
+    { nilai: 550 },
+    { nilai: 600 },
+    { nilai: 650 },
+    { nilai: 700 },
+  ]), 600);
 });
