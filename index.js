@@ -5,6 +5,7 @@ import http from "http";
 import {
   buildTkaSubjectResult,
   calculateTkaAggregateScore,
+  getEstimatedTkaCategory,
   hasTkaIstimewaPredicate,
   toTkaScaledScoreFromTotal,
 } from "./tkaScoring.js";
@@ -166,6 +167,17 @@ async function ensureNightlySchedulerTable(conn) {
       INDEX idx_nightly_status (status, process_date)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
+}
+
+async function ensureRankAdditionalInfoColumn(conn) {
+  const [columns] = await conn.query(
+    `SHOW COLUMNS FROM rank_tryout_2025 LIKE 'additional_info'`
+  );
+  if (!columns.length) {
+    await conn.query(
+      `ALTER TABLE rank_tryout_2025 ADD COLUMN additional_info JSON NULL AFTER year`
+    );
+  }
 }
 
 function postLocalPengumuman(path, payload = {}, timeoutMs = 15 * 60 * 1000) {
@@ -743,6 +755,7 @@ app.post("/process-tryout", async (req, res) => {
 
   try {
     let stepStart = Date.now();
+    await ensureRankAdditionalInfoColumn(conn);
     await conn.beginTransaction();
     mark("begin_transaction_ms", stepStart);
 
@@ -1028,7 +1041,7 @@ app.post("/process-tryout", async (req, res) => {
       await conn.query(
         `
         INSERT INTO rank_tryout_2025
-        (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year)
+        (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year, additional_info)
         SELECT
           r.id_user,
           r.username,
@@ -1038,13 +1051,25 @@ app.post("/process-tryout", async (req, res) => {
           ud.provinsi,
           r.rnk,
           ?,
-          2026
+          2026,
+          r.additional_info
         FROM (
           SELECT
             n.id_user,
             n.username,
             n.peminatan,
             n.total,
+            JSON_OBJECT(
+              'predikat', CASE
+                WHEN n.subject_count >= 5 AND n.min_subject_score >= 725 THEN 'Istimewa'
+                WHEN n.total >= 620 THEN 'Baik'
+                WHEN n.total >= 500 THEN 'Memadai'
+                ELSE 'Kurang'
+              END,
+              'jumlah_mata_uji', n.subject_count,
+              'lengkap', n.subject_count >= 5,
+              'skor_terendah_mata_uji', n.min_subject_score
+            ) AS additional_info,
             ROW_NUMBER() OVER (ORDER BY n.total DESC) AS rnk
           FROM (
             SELECT
@@ -1059,7 +1084,9 @@ app.post("/process-tryout", async (req, res) => {
                   SUM(200 + (scored.weighted_percent * 6))
                   + (GREATEST(0, 5 - COUNT(*)) * 200)
                 ) / GREATEST(5, COUNT(*))
-              )) AS total
+              )) AS total,
+              COUNT(*) AS subject_count,
+              MIN(200 + (scored.weighted_percent * 6)) AS min_subject_score
             FROM (
               SELECT
                 jut.id_user,
@@ -1483,6 +1510,7 @@ app.post("/process-tryout-user", async (req, res) => {
     const isUmUns = isUmUnsJenis(normalizedJenis);
 
     let stepStart = Date.now();
+    await ensureRankAdditionalInfoColumn(conn);
     await conn.beginTransaction();
     mark("begin_transaction_ms", stepStart);
 
@@ -1849,11 +1877,23 @@ app.post("/process-tryout-user", async (req, res) => {
       `DELETE FROM rank_tryout_2025 WHERE id_tryout = ? AND id_user = ?`,
       [idTryout, idUser]
     );
+    const tkaAdditionalInfo = normalizedJenis === "tka"
+      ? JSON.stringify({
+          predikat: hasTkaIstimewaPredicate(tkaSubjects, 5)
+            ? "Istimewa"
+            : getEstimatedTkaCategory(finalTotal),
+          jumlah_mata_uji: tkaSubjects.length,
+          lengkap: tkaSubjects.length >= 5,
+          skor_terendah_mata_uji: tkaSubjects.length
+            ? Math.min(...tkaSubjects.map((subject) => Number(subject.nilai) || 200))
+            : 200,
+        })
+      : null;
     await conn.query(
       `
       INSERT INTO rank_tryout_2025
-      (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2026)
+      (id_user, username, peminatan, total, instansi, provinsi, \`rank\`, id_tryout, year, additional_info)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2026, ?)
       `,
       [
         Number(idUser),
@@ -1864,6 +1904,7 @@ app.post("/process-tryout-user", async (req, res) => {
         userRows[0].provinsi || null,
         0,
         Number(idTryout),
+        tkaAdditionalInfo,
       ]
     );
     mark("upsert_rank_ms", stepStart);
@@ -2021,6 +2062,7 @@ app.get("/ranking/:idTryout", async (req, res) => {
           COALESCE(r.instansi, '-') AS instansi,
           COALESCE(r.provinsi, 0) AS provinsi,
           r.rank,
+          r.additional_info,
           t.tipe_tryout,
           p.province_name,
           u.image
@@ -2054,6 +2096,15 @@ app.get("/ranking/:idTryout", async (req, res) => {
 // jalankan server
 const server = app.listen(2234, () => {
   console.log("Server pengumuman running on http://localhost:2234");
+  pool.getConnection()
+    .then(async (conn) => {
+      try {
+        await ensureRankAdditionalInfoColumn(conn);
+      } finally {
+        conn.release();
+      }
+    })
+    .catch((err) => console.error("Gagal memastikan kolom rank additional_info", err));
 });
 
 const nightlySchedulerTimer = setInterval(
