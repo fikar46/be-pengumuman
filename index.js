@@ -1088,7 +1088,7 @@ app.post("/process-tryout", async (req, res) => {
               GROUP BY jut.id_user, u.username, jut.id_mapel
             ) scored
             GROUP BY scored.id_user, scored.username
-            HAVING COUNT(DISTINCT scored.id_mapel) >= 5
+            HAVING COUNT(*) >= 5
           ) n
         ) r
         LEFT JOIN userdata ud ON ud.id_user = r.id_user;
