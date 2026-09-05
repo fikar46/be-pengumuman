@@ -1050,7 +1050,9 @@ app.post("/process-tryout", async (req, res) => {
               scored.id_user,
               scored.username,
               COALESCE(MAX(NULLIF(scored.peminatan, '')), 'ipc') AS peminatan,
-              LEAST(500, SUM(scored.weighted_percent)) AS total
+              /* Simpan agregat ranking pada skala IRT yang sama dengan
+                 pengumuman: rata-rata skor tiap mata uji (200-800). */
+              GREATEST(200, LEAST(800, AVG(200 + (scored.weighted_percent * 6)))) AS total
             FROM (
               SELECT
                 jut.id_user,
@@ -1803,7 +1805,7 @@ app.post("/process-tryout-user", async (req, res) => {
     }
 
     const rawTotal = Number(scoreRows[0].raw_total || 0);
-    const userPeminatan = scoreRows[0].peminatan || ((isKedinasan || isSimakUi || isUmUns) ? "ipc" : "Saintek");
+    const userPeminatan = scoreRows[0].peminatan || ((normalizedJenis === "tka" || isKedinasan || isSimakUi || isUmUns) ? "ipc" : "Saintek");
     let finalTotal = (isUmUgm || isSimakUi)
       ? (rawTotal / (isSimakUi ? 420 : 360)) * 1000
       : (normalizedJenis === "tka" || isKedinasan
@@ -1812,11 +1814,11 @@ app.post("/process-tryout-user", async (req, res) => {
     if (isSimakUi) {
       finalTotal = Math.max(0, Math.min(1000, finalTotal));
     } else if (normalizedJenis === "tka") {
-      finalTotal = tkaSubjects.reduce(
-        (total, subject) => total + ((Number(subject.nilai || 200) - 200) / 6),
-        0
-      );
-      finalTotal = Math.max(0, Math.min(500, finalTotal));
+      const subjectScores = tkaSubjects.map((subject) => Number(subject.nilai)).filter(Number.isFinite);
+      const averageScore = subjectScores.length
+        ? subjectScores.reduce((total, score) => total + score, 0) / subjectScores.length
+        : 200;
+      finalTotal = Math.max(200, Math.min(800, Number(averageScore.toFixed(2))));
     }
 
     // 7) Upsert ranking user ke rank_tryout_2025
