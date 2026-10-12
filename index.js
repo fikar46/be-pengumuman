@@ -1477,6 +1477,8 @@ app.post("/process-tryout-user/status", async (req, res) => {
 // 🚀 API untuk proses pengumuman per-user (versi ringan untuk halaman user)
 app.post("/process-tryout-user", async (req, res) => {
   const { idTryout, idUser, jenis, tipe_tryout } = req.body;
+  const numericTryoutId = Number(idTryout);
+  const numericUserId = Number(idUser);
   const requestMeta = {
     idTryout,
     idUser,
@@ -1484,7 +1486,8 @@ app.post("/process-tryout-user", async (req, res) => {
     ip: req.ip,
   };
 
-  if (!idTryout || !idUser) {
+  if (!Number.isSafeInteger(numericTryoutId) || numericTryoutId <= 0
+    || !Number.isSafeInteger(numericUserId) || numericUserId <= 0) {
     logProcessTryoutUser("warn", "invalid request body", {
       ...requestMeta,
       bodyKeys: Object.keys(req.body || {}),
@@ -1931,14 +1934,22 @@ app.post("/process-tryout-user", async (req, res) => {
     await conn.commit();
     mark("commit_ms", stepStart);
 
-    // 9) Invalidate cache yang terkait halaman pengumuman user ini saja
+    // 9) Cache per-user dan leaderboard pilihan jurusan sama-sama berubah.
+    // Kunci leaderboard dipakai bersama oleh semua peserta yang memilih prodi
+    // tersebut, jadi bersihkan seluruh ranking jurusan untuk tryout ini.
     stepStart = Date.now();
     const cacheClear = await deleteRedisKeysByPatterns([
-      `nilaitosaintek_${idTryout}_${idUser}_*`,
-      `nilaitososhum_${idTryout}_${idUser}_*`,
-      `nilaitoipc_${idTryout}_${idUser}_*`,
-      `status_pengumuman_to_${idTryout}_${idUser}_*`,
-      `check_rank_per_tryout_${idTryout}_${idUser}*`,
+      `nilaitosaintek_${numericTryoutId}_${numericUserId}_*`,
+      `nilaitososhum_${numericTryoutId}_${numericUserId}_*`,
+      `nilaitoipc_${numericTryoutId}_${numericUserId}_*`,
+      `status_pengumuman_to_${numericTryoutId}_${numericUserId}_*`,
+      `check_rank_per_tryout_${numericTryoutId}_${numericUserId}*`,
+      `rekomendasi_jurusan_${numericUserId}_${numericTryoutId}_*`,
+      `get_data_rank_perjurusan_*_${numericTryoutId}_*`,
+      `total_peserta_tryout_${numericTryoutId}_*`,
+      `top10saintek_${numericTryoutId}`,
+      `top10soshum_${numericTryoutId}`,
+      `top10tps_${numericTryoutId}`,
     ]);
     mark("clear_related_cache_ms", stepStart);
 
