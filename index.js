@@ -152,6 +152,15 @@ function addCalendarDays(dateValue, days) {
   return date.toISOString().slice(0, 10);
 }
 
+function getTryoutEndDateSql(alias = "t") {
+  return `COALESCE(
+    DATE(STR_TO_DATE(${alias}.end_time, '%e %M %Y')),
+    DATE(STR_TO_DATE(${alias}.end_time, '%e %b %Y')),
+    DATE(STR_TO_DATE(${alias}.end_time, '%d/%m/%Y')),
+    DATE(${alias}.end_time)
+  )`;
+}
+
 async function ensureNightlySchedulerTable(conn) {
   await conn.query(`
     CREATE TABLE IF NOT EXISTS tryout_nightly_process_log (
@@ -167,6 +176,106 @@ async function ensureNightlySchedulerTable(conn) {
       INDEX idx_nightly_status (status, process_date)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
+}
+
+async function ensureAnnouncementSchedulerTable(conn) {
+  await conn.query(`
+    CREATE TABLE IF NOT EXISTS tryout_announcement_process_log (
+      id BIGINT NOT NULL AUTO_INCREMENT,
+      id_tryout BIGINT NOT NULL,
+      process_date DATE NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'running',
+      started_at DATETIME NOT NULL,
+      finished_at DATETIME NULL,
+      error_message TEXT NULL,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_tryout_announcement_process (id_tryout),
+      INDEX idx_announcement_process_status (status, process_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+}
+
+let announcementSchedulerRunning = false;
+async function runTryoutAnnouncementScheduler() {
+  if (announcementSchedulerRunning) return;
+  announcementSchedulerRunning = true;
+  let conn;
+  try {
+    const jakartaNow = getJakartaDateParts();
+    conn = await pool.getConnection();
+    await ensureAnnouncementSchedulerTable(conn);
+    await ensureNightlySchedulerTable(conn);
+    const endDateSql = getTryoutEndDateSql("t");
+    const [rows] = await conn.query(`
+      SELECT t.id, DATE_FORMAT(DATE_ADD(${endDateSql}, INTERVAL 1 DAY), '%Y-%m-%d') AS process_date
+      FROM tryout t
+      LEFT JOIN tryout_announcement_process_log l ON l.id_tryout = t.id AND l.status = 'success'
+      WHERE (LOWER(COALESCE(t.jenis, '')) IN ('sbmptn', 'snbt')
+          OR LOWER(COALESCE(t.tipe_tryout, '')) IN ('sbmptn', 'snbt'))
+        AND DATE_ADD(${endDateSql}, INTERVAL 1 DAY) = ?
+        AND l.id IS NULL
+      ORDER BY t.id`, [jakartaNow.date]);
+
+    for (const row of rows) {
+      const lockName = `announce_tryout_${row.id}`;
+      const [locks] = await conn.query('SELECT GET_LOCK(?, 0) AS acquired', [lockName]);
+      if (Number(locks?.[0]?.acquired || 0) !== 1) continue;
+      try {
+        await conn.query(`INSERT INTO tryout_announcement_process_log
+          (id_tryout, process_date, status, started_at, finished_at, error_message)
+          VALUES (?, ?, 'running', NOW(), NULL, NULL)
+          ON DUPLICATE KEY UPDATE status='running', process_date=VALUES(process_date), started_at=NOW(), finished_at=NULL, error_message=NULL`,
+        [row.id, row.process_date]);
+        try {
+          await postLocalPengumuman(`/simpan-jawaban-user/${row.id}`, {});
+          const [subtests] = await conn.query(`
+            SELECT st.id_mapel, st.no_soal,
+              SUM(CASE WHEN jut.status='benar' THEN 1 ELSE 0 END) AS benar,
+              SUM(CASE WHEN jut.status='salah' THEN 1 ELSE 0 END) AS salah,
+              COUNT(*) AS jumlah
+            FROM soal_tryout st
+            LEFT JOIN jawaban_user_tryout jut ON jut.id_tryout=st.id_tryout
+              AND jut.id_mapel=st.id_mapel AND jut.no_soal=st.no_soal
+            WHERE st.id_tryout=? AND st.id_mapel > 0
+            GROUP BY st.id_mapel, st.no_soal
+            HAVING SUM(CASE WHEN jut.status IN ('benar', 'salah') THEN 1 ELSE 0 END) > 0`, [row.id]);
+          const countsByMapel = new Map();
+          for (const item of subtests) countsByMapel.set(item.id_mapel, (countsByMapel.get(item.id_mapel) || 0) + 1);
+          for (const item of subtests) {
+            const total = Number(item.benar || 0) + Number(item.salah || 0);
+            if (!total) continue;
+            const point = (1 - Number(item.benar || 0) / total) / ((countsByMapel.get(item.id_mapel) || 1) / 10);
+            await conn.query('UPDATE soal_tryout SET point=? WHERE id_tryout=? AND id_mapel=? AND no_soal=?',
+              [point, row.id, item.id_mapel, item.no_soal]);
+          }
+          await postLocalPengumuman('/process-tryout', {
+            idTryout: row.id, jenis: 'sbmptn', forceReweight: true, schedulerProcessDate: row.process_date,
+          });
+          const [existingAnnouncement] = await conn.query(
+            'SELECT id FROM pengumuman WHERE id_tryout=? LIMIT 1', [row.id]
+          );
+          if (existingAnnouncement.length) {
+            await conn.query('UPDATE pengumuman SET pengumuman=TRUE WHERE id_tryout=?', [row.id]);
+          } else {
+            await conn.query('INSERT INTO pengumuman (id_tryout, pengumuman) VALUES (?, TRUE)', [row.id]);
+          }
+          await conn.query(`UPDATE tryout_announcement_process_log SET status='success', finished_at=NOW(), error_message=NULL WHERE id_tryout=?`, [row.id]);
+          console.log('[announcement-scheduler] success', { idTryout: row.id, processDate: row.process_date });
+        } catch (error) {
+          await conn.query(`UPDATE tryout_announcement_process_log SET status='failed', finished_at=NOW(), error_message=? WHERE id_tryout=?`,
+            [String(error.message || error).slice(0, 4000), row.id]);
+          console.error('[announcement-scheduler] failed', { idTryout: row.id, message: error.message });
+        }
+      } finally {
+        await conn.query('SELECT RELEASE_LOCK(?)', [lockName]);
+      }
+    }
+  } catch (error) {
+    console.error('[announcement-scheduler] tick failed', { message: error.message });
+  } finally {
+    if (conn) conn.release();
+    announcementSchedulerRunning = false;
+  }
 }
 
 async function ensureRankAdditionalInfoColumn(conn) {
@@ -2118,6 +2227,36 @@ const server = app.listen(2234, () => {
     .catch((err) => console.error("Gagal memastikan kolom rank additional_info", err));
 });
 
+app.get('/announcement-scheduler-status/:idTryout', async (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  const conn = await pool.getConnection();
+  try {
+    await ensureAnnouncementSchedulerTable(conn);
+    const endDateSql = getTryoutEndDateSql("t");
+    const [rows] = await conn.query(`
+      SELECT status, DATE_FORMAT(process_date, '%Y-%m-%d') AS process_date,
+        DATE_FORMAT(started_at, '%Y-%m-%d %H:%i:%s') AS started_at,
+        DATE_FORMAT(finished_at, '%Y-%m-%d %H:%i:%s') AS finished_at, error_message
+      FROM tryout_announcement_process_log WHERE id_tryout=? LIMIT 1`, [req.params.idTryout]);
+    const [tryouts] = await conn.query(`SELECT
+      DATE_FORMAT(DATE_ADD(${endDateSql}, INTERVAL 1 DAY), '%Y-%m-%d') AS scheduled_date,
+      COALESCE((SELECT p.pengumuman FROM pengumuman p WHERE p.id_tryout=t.id LIMIT 1), FALSE) AS announcement_open
+      FROM tryout t WHERE t.id=? LIMIT 1`, [req.params.idTryout]);
+    const [resultRows] = await conn.query(`SELECT DATE_FORMAT(MAX(finished_at), '%Y-%m-%d %H:%i:%s') AS processed_at
+      FROM tryout_nightly_process_log WHERE id_tryout=? AND status='success'`, [req.params.idTryout]);
+    res.json({
+      scheduledDate: tryouts[0]?.scheduled_date || null,
+      announcementOpen: ["1", "true"].includes(String(tryouts[0]?.announcement_open ?? "").toLowerCase()),
+      process: rows[0] || null,
+      resultProcessedAt: resultRows[0]?.processed_at || null,
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Gagal mengambil status scheduler', error: error.message });
+  } finally {
+    conn.release();
+  }
+});
+
 const nightlySchedulerTimer = setInterval(
   runNightlyTryoutScheduler,
   NIGHTLY_SCHEDULER_INTERVAL_MS
@@ -2126,6 +2265,11 @@ nightlySchedulerTimer.unref();
 
 const initialNightlySchedulerTimer = setTimeout(runNightlyTryoutScheduler, 5000);
 initialNightlySchedulerTimer.unref();
+
+const announcementSchedulerTimer = setInterval(runTryoutAnnouncementScheduler, NIGHTLY_SCHEDULER_INTERVAL_MS);
+announcementSchedulerTimer.unref();
+const initialAnnouncementSchedulerTimer = setTimeout(runTryoutAnnouncementScheduler, 7000);
+initialAnnouncementSchedulerTimer.unref();
 
 server.timeout = 600000; // untuk request
 server.keepAliveTimeout = 620000; // jaga supaya koneksi gak putus duluan
